@@ -43,12 +43,6 @@ option(WEBP_BUILD_EXTRAS "Build extras." ON)
 option(WEBP_BUILD_WEBP_JS "Emscripten build of webp.js." OFF)
 option(WEBP_BUILD_FUZZTEST "Build the fuzztest tests." OFF)
 option(WEBP_USE_THREAD "Enable threading support" ON)
-option(
-  WEBP_EXPERIMENTAL_MT_HASH_CHAIN
-  "Enable the experimental multi-threaded match search for lossless encoding \
-(used when WebPConfig.thread_level > 0). The bitstreams it produces are \
-deterministic and valid but slightly differ from the single-threaded ones."
-  OFF)
 option(WEBP_NEAR_LOSSLESS "Enable near-lossless encoding" ON)
 option(WEBP_ENABLE_SWAP_16BIT_CSP "Enable byte swap for 16 bit colorspaces."
        OFF)
@@ -139,14 +133,6 @@ endif()
 # Options.
 if(WEBP_ENABLE_SWAP_16BIT_CSP)
   add_definitions(-DWEBP_SWAP_16BIT_CSP=1)
-endif()
-
-if(WEBP_EXPERIMENTAL_MT_HASH_CHAIN)
-  if(NOT WEBP_USE_THREAD)
-    message(FATAL_ERROR "WEBP_EXPERIMENTAL_MT_HASH_CHAIN requires \
-WEBP_USE_THREAD.")
-  endif()
-  add_definitions(-DWEBP_EXPERIMENTAL_MT_HASH_CHAIN=1)
 endif()
 
 if(NOT WEBP_BITTRACE STREQUAL "0")

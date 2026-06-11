@@ -21,9 +21,7 @@
 #include "src/enc/histogram_enc.h"
 #include "src/enc/vp8i_enc.h"
 #include "src/utils/color_cache_utils.h"
-#if defined(WEBP_EXPERIMENTAL_MT_HASH_CHAIN)
 #include "src/utils/thread_utils.h"
-#endif
 #include "src/utils/utils.h"
 #include "src/webp/encode.h"
 #include "src/webp/format_constants.h"
@@ -365,16 +363,17 @@ static int HashChainFillSearch(VP8LHashChain* const p,
   return 1;
 }
 
-#if defined(WEBP_EXPERIMENTAL_MT_HASH_CHAIN)
-
-// The match search is processed in chunks of this many positions, handed out
-// to the workers. The chunking (and therefore the output) is the same
-// whatever the number of threads actually available; positions at the high
-// end of a chunk can however get a different (but equally valid) match
-// interval than in the single-threaded version, as matches do not get
-// extended to the left across chunk boundaries.
-#define MT_HASH_CHAIN_CHUNK_SIZE (1 << 18)
-#define MT_HASH_CHAIN_MAX_WORKERS 8
+// The match search is processed in chunks of this many positions, which can
+// be handed out to workers. Matches do not get extended to the left across
+// chunk boundaries (in the single-threaded search either), making the output
+// identical whatever the number of threads (including one). The value
+// balances multi-thread load distribution (favoring small chunks) against
+// the compression cost of the boundaries (negligible at and above 64K
+// positions, measurable at 32K and below).
+#ifndef HASH_CHAIN_CHUNK_SIZE  /* overridable for experiments */
+#define HASH_CHAIN_CHUNK_SIZE (1 << 16)
+#endif
+#define HASH_CHAIN_MAX_WORKERS 8
 
 typedef struct {
   VP8LHashChain* p;
@@ -394,10 +393,10 @@ static int HashChainFillJobHook(void* arg1, void* arg2) {
   int chunk;
   (void)arg2;
   for (chunk = job->first_chunk;
-       1 + chunk * MT_HASH_CHAIN_CHUNK_SIZE <= job->size - 2;
+       1 + chunk * HASH_CHAIN_CHUNK_SIZE <= job->size - 2;
        chunk += job->num_workers) {
-    const int lo = 1 + chunk * MT_HASH_CHAIN_CHUNK_SIZE;
-    int from = lo + MT_HASH_CHAIN_CHUNK_SIZE - 1;
+    const int lo = 1 + chunk * HASH_CHAIN_CHUNK_SIZE;
+    int from = lo + HASH_CHAIN_CHUNK_SIZE - 1;
     if (from > job->size - 2) from = job->size - 2;
     HashChainFillSearch(job->p, job->chain, job->argb, job->size, job->xsize,
                         job->iter_max, job->window_size, job->low_effort, lo,
@@ -417,13 +416,13 @@ static int HashChainFillSearchMT(VP8LHashChain* const p,
                                  int xsize, int iter_max, uint32_t window_size,
                                  int low_effort) {
   const int num_chunks =
-      (size - 2 + MT_HASH_CHAIN_CHUNK_SIZE - 1) / MT_HASH_CHAIN_CHUNK_SIZE;
-  const int num_workers = (num_chunks < MT_HASH_CHAIN_MAX_WORKERS)
+      (size - 2 + HASH_CHAIN_CHUNK_SIZE - 1) / HASH_CHAIN_CHUNK_SIZE;
+  const int num_workers = (num_chunks < HASH_CHAIN_MAX_WORKERS)
                               ? num_chunks
-                              : MT_HASH_CHAIN_MAX_WORKERS;
+                              : HASH_CHAIN_MAX_WORKERS;
   const WebPWorkerInterface* const worker_interface = WebPGetWorkerInterface();
-  WebPWorker workers[MT_HASH_CHAIN_MAX_WORKERS];
-  HashChainFillJob jobs[MT_HASH_CHAIN_MAX_WORKERS];
+  WebPWorker workers[HASH_CHAIN_MAX_WORKERS];
+  HashChainFillJob jobs[HASH_CHAIN_MAX_WORKERS];
   int i, ok = 1;
   int32_t* const chain =
       (int32_t*)WebPSafeMalloc(size, sizeof(*chain));
@@ -465,8 +464,6 @@ static int HashChainFillSearchMT(VP8LHashChain* const p,
   return ok;
 }
 
-#endif  // WEBP_EXPERIMENTAL_MT_HASH_CHAIN
-
 int VP8LHashChainFill(VP8LHashChain* const p, int quality,
                       const uint32_t* const argb, int xsize, int ysize,
                       int low_effort, int use_threads,
@@ -485,7 +482,6 @@ int VP8LHashChainFill(VP8LHashChain* const p, int quality,
   assert(size > 0);
   assert(p->size != 0);
   assert(p->offset_length != NULL);
-  (void)use_threads;
 
   if (size <= 2) {
     p->offset_length[0] = p->offset_length[size - 1] = 0;
@@ -567,20 +563,32 @@ int VP8LHashChainFill(VP8LHashChain* const p, int quality,
   // (hence a best length of 0) and the left-most pixel nothing to the left
   // (hence an offset of 0).
   assert(size > 2);
-#if defined(WEBP_EXPERIMENTAL_MT_HASH_CHAIN)
-  if (use_threads > 0 && size - 2 > MT_HASH_CHAIN_CHUNK_SIZE) {
-    if (HashChainFillSearchMT(p, argb, size, xsize, iter_max, window_size,
+  {
+    const int num_chunks =
+        (size - 2 + HASH_CHAIN_CHUNK_SIZE - 1) / HASH_CHAIN_CHUNK_SIZE;
+    int chunk;
+    if (use_threads > 0 && num_chunks > 1 &&
+        HashChainFillSearchMT(p, argb, size, xsize, iter_max, window_size,
                               low_effort)) {
       return WebPReportProgress(pic, percent_start + percent_range, percent);
     }
-    // else fall back to the single-threaded search below.
-  }
-#endif
-  p->offset_length[0] = p->offset_length[size - 1] = 0;
-  if (!HashChainFillSearch(p, chain, argb, size, xsize, iter_max, window_size,
-                           low_effort, /*lo=*/1, /*from=*/size - 2, pic,
-                           percent_range, percent_start, percent)) {
-    return 0;
+    // Single-threaded search (or fall back to it on thread or memory
+    // failure), over the exact same chunks: the output does not depend on
+    // 'use_threads'. The chunks are processed from the highest positions down
+    // so that the chain links (stored in place of the match intervals) are
+    // still intact when a lower chunk reads them, and so that the reported
+    // progress increases monotonically.
+    p->offset_length[0] = p->offset_length[size - 1] = 0;
+    for (chunk = num_chunks - 1; chunk >= 0; --chunk) {
+      const int lo = 1 + chunk * HASH_CHAIN_CHUNK_SIZE;
+      int from = lo + HASH_CHAIN_CHUNK_SIZE - 1;
+      if (from > size - 2) from = size - 2;
+      if (!HashChainFillSearch(p, chain, argb, size, xsize, iter_max,
+                               window_size, low_effort, lo, from, pic,
+                               percent_range, percent_start, percent)) {
+        return 0;
+      }
+    }
   }
 
   return WebPReportProgress(pic, percent_start + percent_range, percent);

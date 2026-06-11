@@ -131,9 +131,8 @@ struct VP8LHashChain {
 // Must be called first, to set size.
 int VP8LHashChainInit(VP8LHashChain* const p, int size);
 // Pre-compute the best matches for argb. pic and percent are for progress.
-// 'use_threads' is only used if WEBP_EXPERIMENTAL_MT_HASH_CHAIN is defined at
-// compile time, in which case a positive value enables the multi-threaded
-// match search (whose output slightly differs from the single-threaded one).
+// A positive 'use_threads' enables the multi-threaded match search; the
+// output is the same whatever the number of threads.
 int VP8LHashChainFill(VP8LHashChain* const p, int quality,
                       const uint32_t* const argb, int xsize, int ysize,
                       int low_effort, int use_threads,
