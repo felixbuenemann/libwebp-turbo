@@ -952,7 +952,7 @@ static int ReconstructUV(VP8EncIterator* WEBP_RESTRICT const it,
 // RD-opt decision. Reconstruct each modes, evalue distortion and bit-cost.
 // Pick the mode is lower RD-cost = Rate + lambda * Distortion.
 
-static void StoreMaxDelta(VP8SegmentInfo* const dqm, const int16_t DCs[16]) {
+static void StoreMaxDelta(int* const max_edge, const int16_t DCs[16]) {
   // We look at the first three AC coefficients to determine what is the average
   // delta between each sub-4x4 block.
   const int v0 = abs(DCs[1]);
@@ -960,7 +960,7 @@ static void StoreMaxDelta(VP8SegmentInfo* const dqm, const int16_t DCs[16]) {
   const int v2 = abs(DCs[4]);
   int max_v = (v1 > v0) ? v1 : v0;
   max_v = (v2 > max_v) ? v2 : max_v;
-  if (max_v > dqm->max_edge) dqm->max_edge = max_v;
+  if (max_v > *max_edge) *max_edge = max_v;
 }
 
 static void SwapModeScore(VP8ModeScore** a, VP8ModeScore** b) {
@@ -1031,9 +1031,11 @@ static void PickBestIntra16(VP8EncIterator* WEBP_RESTRICT const it,
 
   // we have a blocky macroblock (only DCs are non-zero) with fairly high
   // distortion, record max delta so we can later adjust the minimal filtering
-  // strength needed to smooth these blocks out.
+  // strength needed to smooth these blocks out. The delta is accumulated in
+  // the iterator and merged into the segments at the end of the scan, so that
+  // concurrent iterators do not write to the shared segment info.
   if ((rd->nz & 0x100ffff) == 0x1000000 && rd->D > dqm->min_disto) {
-    StoreMaxDelta(dqm, rd->y_dc_levels);
+    StoreMaxDelta(&it->max_edge[it->mb->segment], rd->y_dc_levels);
   }
 }
 

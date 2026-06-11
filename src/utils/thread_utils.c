@@ -307,3 +307,66 @@ const WebPWorkerInterface* WebPGetWorkerInterface(void) {
 }
 
 //------------------------------------------------------------------------------
+// Monitor
+
+#ifdef WEBP_USE_THREAD
+
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_cond_t condition;
+} WebPMonitorImpl;
+
+void* WebPMonitorNew(void) {
+  WebPMonitorImpl* const impl =
+      (WebPMonitorImpl*)WebPSafeMalloc(1ULL, sizeof(*impl));
+  if (impl == NULL) return NULL;
+  if (pthread_mutex_init(&impl->mutex, NULL)) {
+    WebPSafeFree(impl);
+    return NULL;
+  }
+  if (pthread_cond_init(&impl->condition, NULL)) {
+    pthread_mutex_destroy(&impl->mutex);
+    WebPSafeFree(impl);
+    return NULL;
+  }
+  return impl;
+}
+
+void WebPMonitorDelete(void* monitor) {
+  if (monitor != NULL) {
+    WebPMonitorImpl* const impl = (WebPMonitorImpl*)monitor;
+    pthread_mutex_destroy(&impl->mutex);
+    pthread_cond_destroy(&impl->condition);
+    WebPSafeFree(impl);
+  }
+}
+
+void WebPMonitorLock(void* monitor) {
+  pthread_mutex_lock(&((WebPMonitorImpl*)monitor)->mutex);
+}
+
+void WebPMonitorUnlock(void* monitor) {
+  pthread_mutex_unlock(&((WebPMonitorImpl*)monitor)->mutex);
+}
+
+void WebPMonitorWait(void* monitor) {
+  WebPMonitorImpl* const impl = (WebPMonitorImpl*)monitor;
+  pthread_cond_wait(&impl->condition, &impl->mutex);
+}
+
+void WebPMonitorBroadcast(void* monitor) {
+  pthread_cond_broadcast(&((WebPMonitorImpl*)monitor)->condition);
+}
+
+#else  // !WEBP_USE_THREAD
+
+void* WebPMonitorNew(void) { return NULL; }
+void WebPMonitorDelete(void* monitor) { (void)monitor; }
+void WebPMonitorLock(void* monitor) { (void)monitor; }
+void WebPMonitorUnlock(void* monitor) { (void)monitor; }
+void WebPMonitorWait(void* monitor) { (void)monitor; }
+void WebPMonitorBroadcast(void* monitor) { (void)monitor; }
+
+#endif  // WEBP_USE_THREAD
+
+//------------------------------------------------------------------------------

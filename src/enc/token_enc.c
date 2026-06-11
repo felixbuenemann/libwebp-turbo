@@ -225,6 +225,31 @@ int VP8EmitTokens(VP8TBuffer* const b, VP8BitWriter* const bw,
   return 1;
 }
 
+// Re-applies the recorded tokens to 'stats' (flat-indexed like the 'probas'
+// array of VP8EmitTokens()), in recording order. This reproduces the exact
+// statistics that direct recording would have accumulated.
+void VP8TokenReplayStats(const VP8TBuffer* const b, proba_t* const stats) {
+  const VP8Tokens* p = b->pages;
+  assert(!b->error);
+  while (p != NULL) {
+    const VP8Tokens* const next = p->next;
+    const int N = (next == NULL) ? b->left : 0;
+    int n = b->page_size;
+    const token_t* const tokens = TOKEN_DATA(p);
+    while (n-- > N) {
+      const token_t token = tokens[n];
+      if (!(token & FIXED_PROBA_BIT)) {
+        // The Cat5/Cat6 selector is recorded as AddToken(.., base_id + 10,
+        // s + 9): its statistics slot is 9, not the emission index 10.
+        const uint32_t idx = token & 0x3fffu;
+        VP8RecordStats((token >> 15) & 1,
+                       stats + idx - ((idx % NUM_PROBAS) == 10));
+      }
+    }
+    p = next;
+  }
+}
+
 // Size estimation
 size_t VP8EstimateTokenSize(VP8TBuffer* const b, const uint8_t* const probas) {
   size_t size = 0;

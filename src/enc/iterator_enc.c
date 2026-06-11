@@ -75,19 +75,46 @@ int VP8IteratorIsDone(const VP8EncIterator* const it) {
   return (it->count_down <= 0);
 }
 
-void VP8IteratorInit(VP8Encoder* const enc, VP8EncIterator* const it) {
+static void IteratorSetup(VP8Encoder* const enc, VP8EncIterator* const it) {
   it->enc = enc;
   it->yuv_in = (uint8_t*)WEBP_ALIGN(it->yuv_mem);
   it->yuv_out = it->yuv_in + YUV_SIZE_ENC;
   it->yuv_out2 = it->yuv_out + YUV_SIZE_ENC;
   it->yuv_p = it->yuv_out2 + YUV_SIZE_ENC;
   it->lf_stats = enc->lf_stats;
-  it->percent0 = enc->percent;
   it->y_left = (uint8_t*)WEBP_ALIGN(it->yuv_left_mem + 1);
   it->u_left = it->y_left + 16 + 16;
   it->v_left = it->u_left + 16;
   it->top_derr = enc->top_derr;
+  memset(it->max_edge, 0, sizeof(it->max_edge));
+}
+
+void VP8IteratorInit(VP8Encoder* const enc, VP8EncIterator* const it) {
+  IteratorSetup(enc, it);
+  it->percent0 = enc->percent;
   VP8IteratorReset(it);
+}
+
+void VP8IteratorInitWorker(VP8Encoder* const enc, VP8EncIterator* const it) {
+  IteratorSetup(enc, it);
+  // This iterator joins a scan already in progress: the shared top boundary
+  // conditions ('y_top', 'nz', 'top_derr', ...) must be left untouched, and
+  // 'enc->percent' may be concurrently updated (it is not used by workers).
+  it->percent0 = 0;
+  VP8IteratorSetRow(it, 0);
+  VP8IteratorSetCountDown(it, 0);
+  memset(it->bit_count, 0, sizeof(it->bit_count));
+  it->do_trellis = 0;
+}
+
+void VP8IteratorMergeMaxEdge(const VP8EncIterator* const it) {
+  VP8Encoder* const enc = it->enc;
+  int s;
+  for (s = 0; s < NUM_MB_SEGMENTS; ++s) {
+    if (it->max_edge[s] > enc->dqm[s].max_edge) {
+      enc->dqm[s].max_edge = it->max_edge[s];
+    }
+  }
 }
 
 int VP8IteratorProgress(const VP8EncIterator* const it, int delta) {

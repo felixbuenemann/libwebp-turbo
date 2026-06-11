@@ -254,6 +254,9 @@ typedef struct {
   int count_down;            // number of mb still to be processed
   int count_down0;           // starting counter value (for progress)
   int percent0;              // saved initial progress percent
+  // max edge delta per segment, merged into 'enc->dqm' at the end of the
+  // scan with VP8IteratorMergeMaxEdge()
+  int max_edge[NUM_MB_SEGMENTS];
 
   DError left_derr;  // left error diffusion (u/v)
   DError* top_derr;  // top diffusion error - NULL if disabled
@@ -274,6 +277,12 @@ typedef struct {
 // in iterator.c
 // must be called first
 void VP8IteratorInit(VP8Encoder* const enc, VP8EncIterator* const it);
+// same as VP8IteratorInit() but leaves the shared top boundary conditions
+// untouched: for extra iterators joining a scan already in progress
+// (multi-threaded token loop)
+void VP8IteratorInitWorker(VP8Encoder* const enc, VP8EncIterator* const it);
+// merge the iterator's accumulated 'max_edge' into the encoder's segments
+void VP8IteratorMergeMaxEdge(const VP8EncIterator* const it);
 // reset iterator position to row 'y'
 void VP8IteratorSetRow(VP8EncIterator* const it, int y);
 // set count down (=number of iterations to go)
@@ -335,6 +344,8 @@ void VP8TBufferClear(VP8TBuffer* const b);  // de-allocate pages memory
 // Deletes the allocated token memory if final_pass is true.
 int VP8EmitTokens(VP8TBuffer* const b, VP8BitWriter* const bw,
                   const uint8_t* const probas, int final_pass);
+// Re-applies the recorded tokens of 'b' to 'stats' in recording order.
+void VP8TokenReplayStats(const VP8TBuffer* const b, proba_t* const stats);
 
 // record the coding of coefficients without knowing the probabilities yet
 int VP8RecordCoeffTokens(int ctx, const struct VP8Residual* const res,

@@ -412,8 +412,12 @@ static void RecordResiduals(VP8EncIterator* const it,
 
 #if !defined(DISABLE_TOKEN_BUFFER)
 
+// 'stats' is where the token statistics get accumulated: enc->proba.stats
+// for direct recording, or a private scratch when the canonical statistics
+// are rebuilt later with VP8TokenReplayStats() (multi-threaded loop).
 static int RecordTokens(VP8EncIterator* const it, const VP8ModeScore* const rd,
-                        VP8TBuffer* const tokens) {
+                        VP8TBuffer* const tokens,
+                        StatsArray (*const stats)[NUM_BANDS]) {
   int x, y, ch;
   VP8Residual res;
   VP8Encoder* const enc = it->enc;
@@ -422,11 +426,14 @@ static int RecordTokens(VP8EncIterator* const it, const VP8ModeScore* const rd,
   if (it->mb->type == 1) {  // i16x16
     const int ctx = it->top_nz[8] + it->left_nz[8];
     VP8InitResidual(0, 1, enc, &res);
+    res.stats = stats[1];
     VP8SetResidualCoeffs(rd->y_dc_levels, &res);
     it->top_nz[8] = it->left_nz[8] = VP8RecordCoeffTokens(ctx, &res, tokens);
     VP8InitResidual(1, 0, enc, &res);
+    res.stats = stats[0];
   } else {
     VP8InitResidual(0, 3, enc, &res);
+    res.stats = stats[3];
   }
 
   // luma-AC
@@ -440,6 +447,7 @@ static int RecordTokens(VP8EncIterator* const it, const VP8ModeScore* const rd,
 
   // U/V
   VP8InitResidual(0, 2, enc, &res);
+  res.stats = stats[2];
   for (ch = 0; ch <= 2; ch += 2) {
     for (y = 0; y < 2; ++y) {
       for (x = 0; x < 2; ++x) {
@@ -479,27 +487,37 @@ static void ResetSSE(VP8Encoder* const enc) {
   enc->sse_count = 0;
 }
 
-static void StoreSSE(const VP8EncIterator* const it) {
-  VP8Encoder* const enc = it->enc;
+// Per-pass accumulators for the side statistics: they are summed separately
+// (possibly per-worker) and applied to the encoder at the end of the last
+// pass, so that the totals do not depend on the accumulation order.
+typedef struct {
+  uint64_t sse[3];
+  uint64_t sse_count;
+  int block_count[3];
+} SideInfoSums;
+
+static void StoreSSE(const VP8EncIterator* const it,
+                     SideInfoSums* const sums) {
   const uint8_t* const in = it->yuv_in;
   const uint8_t* const out = it->yuv_out;
   // Note: not totally accurate at boundary. And doesn't include in-loop filter.
-  enc->sse[0] += VP8SSE16x16(in + Y_OFF_ENC, out + Y_OFF_ENC);
-  enc->sse[1] += VP8SSE8x8(in + U_OFF_ENC, out + U_OFF_ENC);
-  enc->sse[2] += VP8SSE8x8(in + V_OFF_ENC, out + V_OFF_ENC);
-  enc->sse_count += 16 * 16;
+  sums->sse[0] += VP8SSE16x16(in + Y_OFF_ENC, out + Y_OFF_ENC);
+  sums->sse[1] += VP8SSE8x8(in + U_OFF_ENC, out + U_OFF_ENC);
+  sums->sse[2] += VP8SSE8x8(in + V_OFF_ENC, out + V_OFF_ENC);
+  sums->sse_count += 16 * 16;
 }
 
-static void StoreSideInfo(const VP8EncIterator* const it) {
+static void StoreSideInfo(const VP8EncIterator* const it,
+                          SideInfoSums* const sums) {
   VP8Encoder* const enc = it->enc;
   const VP8MBInfo* const mb = it->mb;
   WebPPicture* const pic = enc->pic;
 
   if (pic->stats != NULL) {
-    StoreSSE(it);
-    enc->block_count[0] += (mb->type == 0);
-    enc->block_count[1] += (mb->type == 1);
-    enc->block_count[2] += (mb->skip != 0);
+    StoreSSE(it, sums);
+    sums->block_count[0] += (mb->type == 0);
+    sums->block_count[1] += (mb->type == 1);
+    sums->block_count[2] += (mb->skip != 0);
   }
 
   if (pic->extra_info != NULL) {
@@ -540,6 +558,30 @@ static void StoreSideInfo(const VP8EncIterator* const it) {
 #endif
 }
 
+#ifdef WEBP_USE_THREAD
+static void MergeSideInfoSums(SideInfoSums* const dst,
+                              const SideInfoSums* const src) {
+  dst->sse[0] += src->sse[0];
+  dst->sse[1] += src->sse[1];
+  dst->sse[2] += src->sse[2];
+  dst->sse_count += src->sse_count;
+  dst->block_count[0] += src->block_count[0];
+  dst->block_count[1] += src->block_count[1];
+  dst->block_count[2] += src->block_count[2];
+}
+#endif  // WEBP_USE_THREAD
+
+static void ApplySideInfoSums(VP8Encoder* const enc,
+                              const SideInfoSums* const sums) {
+  enc->sse[0] += sums->sse[0];
+  enc->sse[1] += sums->sse[1];
+  enc->sse[2] += sums->sse[2];
+  enc->sse_count += sums->sse_count;
+  enc->block_count[0] += sums->block_count[0];
+  enc->block_count[1] += sums->block_count[1];
+  enc->block_count[2] += sums->block_count[2];
+}
+
 static void ResetSideInfo(const VP8EncIterator* const it) {
   VP8Encoder* const enc = it->enc;
   WebPPicture* const pic = enc->pic;
@@ -549,16 +591,34 @@ static void ResetSideInfo(const VP8EncIterator* const it) {
   ResetSSE(enc);
 }
 #else   // defined(WEBP_DISABLE_STATS)
+typedef struct { int unused; } SideInfoSums;
+
 static void ResetSSE(VP8Encoder* const enc) { (void)enc; }
-static void StoreSideInfo(const VP8EncIterator* const it) {
+static void StoreSideInfo(const VP8EncIterator* const it,
+                          SideInfoSums* const sums) {
   VP8Encoder* const enc = it->enc;
   WebPPicture* const pic = enc->pic;
+  (void)sums;
   if (pic->extra_info != NULL) {
     if (it->x == 0 && it->y == 0) {  // only do it once, at start
       memset(pic->extra_info, 0,
              enc->mb_w * enc->mb_h * sizeof(*pic->extra_info));
     }
   }
+}
+
+#ifdef WEBP_USE_THREAD
+static void MergeSideInfoSums(SideInfoSums* const dst,
+                              const SideInfoSums* const src) {
+  (void)dst;
+  (void)src;
+}
+#endif  // WEBP_USE_THREAD
+
+static void ApplySideInfoSums(VP8Encoder* const enc,
+                              const SideInfoSums* const sums) {
+  (void)enc;
+  (void)sums;
 }
 
 static void ResetSideInfo(const VP8EncIterator* const it) { (void)it; }
@@ -610,6 +670,7 @@ static uint64_t OneStatPass(VP8Encoder* const enc, VP8RDLevel rd_opt,
     }
     VP8IteratorSaveBoundary(&it);
   } while (VP8IteratorNext(&it) && --nb_mbs > 0);
+  VP8IteratorMergeMaxEdge(&it);
 
   size_p0 += enc->segment_hdr.size;
   if (s->do_size_search) {
@@ -750,6 +811,7 @@ static void ResetAfterSkip(VP8EncIterator* const it) {
 
 int VP8EncLoop(VP8Encoder* const enc) {
   VP8EncIterator it;
+  SideInfoSums side_sums;
   int ok = PreLoopInitialize(enc);
   if (!ok) return 0;
 
@@ -757,6 +819,7 @@ int VP8EncLoop(VP8Encoder* const enc) {
 
   VP8IteratorInit(enc, &it);
   VP8InitFilter(&it);
+  memset(&side_sums, 0, sizeof(side_sums));
   do {
     VP8ModeScore info;
     const int dont_use_skip = !enc->proba.use_skip_proba;
@@ -775,13 +838,15 @@ int VP8EncLoop(VP8Encoder* const enc) {
     } else {  // reset predictors after a skip
       ResetAfterSkip(&it);
     }
-    StoreSideInfo(&it);
+    StoreSideInfo(&it, &side_sums);
     VP8StoreFilterStats(&it);
     VP8IteratorExport(&it);
     ok = VP8IteratorProgress(&it, 20);
     VP8IteratorSaveBoundary(&it);
   } while (ok && VP8IteratorNext(&it));
+  VP8IteratorMergeMaxEdge(&it);
 
+  if (ok) ApplySideInfoSums(enc, &side_sums);
   return PostLoopFinalize(&it, ok);
 }
 
@@ -792,9 +857,334 @@ int VP8EncLoop(VP8Encoder* const enc) {
 
 #define MIN_COUNT 96  // minimum number of macroblocks before updating stats
 
+//------------------------------------------------------------------------------
+// Multi-threaded token loop: the macroblock rows are processed by several
+// workers in a wavefront pattern, a macroblock being processed as soon as the
+// reconstruction of its top-right neighbor is available. The shared context
+// strips (y_top/uv_top, nz, preds, top_derr) are naturally ordered by the
+// wavefront. The probability refreshes happen at row-group boundaries where
+// all workers gather; the canonical statistics are rebuilt there by replaying
+// the recorded tokens in raster order. All inputs of a macroblock decision are
+// therefore the same as in the single-threaded loop and the output bitstream
+// is identical.
+
+#ifdef WEBP_USE_THREAD
+
+#define WAVEFRONT_SYNC_RANGE 16  // publish progress every that many MBs
+#define WAVEFRONT_MAX_THREADS 8
+#define WAVEFRONT_MIN_MB_ROWS 4  // don't bother below that many rows
+
+typedef struct VP8WavefrontCtx VP8WavefrontCtx;
+
+typedef struct {
+  VP8WavefrontCtx* ctx;
+  // Scratch statistics, discarded: the canonical ones are rebuilt by
+  // replaying the tokens. This keeps RecordTokens() off the shared state.
+  StatsArray scratch_stats[NUM_TYPES][NUM_BANDS];
+  uint64_t size_p0;
+  uint64_t distortion;
+  SideInfoSums side_sums;
+} VP8WavefrontWorker;
+
+struct VP8WavefrontCtx {
+  VP8Encoder* enc;
+  void* monitor;
+  VP8RDLevel rd_opt;
+  int is_last_pass;
+  int rows_per_refresh;
+  VP8TBuffer* row_tokens;  // per-row recorded tokens
+  int* row_progress;       // per-row number of processed macroblocks
+  int next_row;            // next row to be claimed by a worker
+  int phase_end;           // rows in [0, phase_end) can be processed
+  int rows_done;           // fully processed rows (they complete in order)
+  int abort;               // error or cancellation: stop as soon as possible
+  int num_threads;         // total number of threads (including the caller)
+  VP8WavefrontWorker* workers;  // one per thread
+  WebPWorker* threads;          // auxiliary threads (num_threads - 1)
+};
+
+// Returns true if macroblock 'x' of row 'y' can be processed ('y' > 0).
+// The monitor must be locked.
+static int WavefrontReady(const VP8WavefrontCtx* const ctx, int x, int y) {
+  int needed = x + 2;  // top and top-right neighbors must be reconstructed
+  if (needed > ctx->enc->mb_w) needed = ctx->enc->mb_w;
+  return (ctx->row_progress[y - 1] >= needed);
+}
+
+static int WavefrontProcessRow(VP8WavefrontWorker* const w,
+                               VP8EncIterator* const it, int y) {
+  VP8WavefrontCtx* const ctx = w->ctx;
+  const int mb_w = ctx->enc->mb_w;
+  VP8TBuffer* const tokens = &ctx->row_tokens[y];
+  int x;
+  int ok = 1;
+  VP8IteratorSetRow(it, y);
+  VP8IteratorSetCountDown(it, mb_w);
+  for (x = 0; ok && x < mb_w; ++x) {
+    VP8ModeScore info;
+    if (y > 0) {  // wait for the wavefront dependency
+      WebPMonitorLock(ctx->monitor);
+      while (!ctx->abort && !WavefrontReady(ctx, x, y)) {
+        WebPMonitorWait(ctx->monitor);
+      }
+      ok = !ctx->abort;
+      WebPMonitorUnlock(ctx->monitor);
+      if (!ok) break;
+    }
+    VP8IteratorImport(it, NULL);
+    VP8Decimate(it, &info, ctx->rd_opt);
+    ok = RecordTokens(it, &info, tokens, w->scratch_stats);
+    w->size_p0 += info.H;
+    w->distortion += info.D;
+    if (ctx->is_last_pass) {
+      StoreSideInfo(it, &w->side_sums);
+      VP8IteratorExport(it);
+    }
+    VP8IteratorSaveBoundary(it);
+    (void)VP8IteratorNext(it);
+    if (!ok || ((x + 1) % WAVEFRONT_SYNC_RANGE) == 0 || (x + 1) == mb_w) {
+      WebPMonitorLock(ctx->monitor);
+      ctx->row_progress[y] = x + 1;
+      if (!ok) {
+        ctx->abort = 1;
+      } else if ((x + 1) == mb_w) {
+        ++ctx->rows_done;
+      }
+      WebPMonitorBroadcast(ctx->monitor);
+      WebPMonitorUnlock(ctx->monitor);
+    }
+  }
+  return ok;
+}
+
+// Claims and processes rows until the pass is complete (or aborted).
+static void WavefrontWorkLoop(VP8WavefrontWorker* const w,
+                              VP8EncIterator* const it) {
+  VP8WavefrontCtx* const ctx = w->ctx;
+  const int mb_h = ctx->enc->mb_h;
+  while (1) {
+    int y = -1;
+    WebPMonitorLock(ctx->monitor);
+    while (!ctx->abort && ctx->next_row >= ctx->phase_end &&
+           ctx->phase_end < mb_h) {
+      WebPMonitorWait(ctx->monitor);  // wait for the next phase
+    }
+    if (!ctx->abort && ctx->next_row < ctx->phase_end) {
+      y = ctx->next_row++;
+    }
+    WebPMonitorUnlock(ctx->monitor);
+    if (y < 0) break;  // aborted or no more rows
+    if (!WavefrontProcessRow(w, it, y)) break;
+  }
+}
+
+static int WavefrontWorkerHook(void* arg1, void* arg2) {
+  VP8WavefrontWorker* const w = (VP8WavefrontWorker*)arg1;
+  VP8EncIterator it;
+  (void)arg2;
+  // Note: VP8IteratorInit() would reset the shared top boundary conditions,
+  // racing with the rows being processed by the other threads.
+  VP8IteratorInitWorker(w->ctx->enc, &it);
+  WavefrontWorkLoop(w, &it);
+  // 'max_edge' is a maximum: merging it under the lock makes the result
+  // independent of the workers' ordering.
+  WebPMonitorLock(w->ctx->monitor);
+  VP8IteratorMergeMaxEdge(&it);
+  WebPMonitorUnlock(w->ctx->monitor);
+  return 1;
+}
+
+// Runs one full pass over the image with the wavefront workers, accumulating
+// into 'size_p0', 'distortion' and 'side_sums'. Returns 0 on error.
+static int WavefrontOnePass(VP8WavefrontCtx* const ctx,
+                            VP8EncIterator* const it, int is_last_pass,
+                            VP8RDLevel rd_opt, int pass_progress,
+                            uint64_t* const size_p0,
+                            uint64_t* const distortion,
+                            SideInfoSums* const side_sums) {
+  const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
+  VP8Encoder* const enc = ctx->enc;
+  VP8EncProba* const proba = &enc->proba;
+  const int mb_h = enc->mb_h;
+  int rows_replayed = 0;
+  int ok = 1;
+  int y, i;
+
+  ctx->rd_opt = rd_opt;
+  ctx->is_last_pass = is_last_pass;
+  ctx->next_row = 0;
+  ctx->rows_done = 0;
+  ctx->abort = 0;
+  ctx->phase_end =
+      (ctx->rows_per_refresh < mb_h) ? ctx->rows_per_refresh : mb_h;
+  for (y = 0; y < mb_h; ++y) {
+    ctx->row_progress[y] = 0;
+    VP8TBufferClear(&ctx->row_tokens[y]);
+  }
+  for (i = 0; i < ctx->num_threads; ++i) {
+    VP8WavefrontWorker* const w = &ctx->workers[i];
+    w->size_p0 = 0;
+    w->distortion = 0;
+    memset(&w->side_sums, 0, sizeof(w->side_sums));
+  }
+  for (i = 1; i < ctx->num_threads; ++i) {
+    winterface->Launch(&ctx->threads[i - 1]);
+  }
+
+  while (1) {
+    int y_claim = -1;
+    WebPMonitorLock(ctx->monitor);
+    while (!ctx->abort && ctx->next_row >= ctx->phase_end &&
+           ctx->rows_done < ctx->phase_end) {
+      WebPMonitorWait(ctx->monitor);  // wait for the phase to drain
+    }
+    if (ctx->abort) {
+      WebPMonitorUnlock(ctx->monitor);
+      ok = 0;
+      break;
+    }
+    if (ctx->next_row < ctx->phase_end) {
+      y_claim = ctx->next_row++;
+    }
+    WebPMonitorUnlock(ctx->monitor);
+    if (y_claim >= 0) {  // the calling thread processes rows too
+      if (!WavefrontProcessRow(&ctx->workers[0], it, y_claim)) {
+        ok = 0;
+        break;
+      }
+      continue;
+    }
+    // Here all the rows of the current phase are done: rebuild the canonical
+    // statistics by replaying the recorded tokens in raster order.
+    for (y = rows_replayed; y < ctx->phase_end; ++y) {
+      VP8TokenReplayStats(&ctx->row_tokens[y], (proba_t*)proba->stats);
+    }
+    rows_replayed = ctx->phase_end;
+    if (ctx->phase_end == mb_h) break;  // pass complete
+    FinalizeTokenProbas(proba);
+    VP8CalculateLevelCosts(proba);  // refresh cost tables for rd-opt
+    if (!WebPReportProgress(
+            enc->pic, it->percent0 + pass_progress * ctx->phase_end / mb_h,
+            &enc->percent)) {
+      ok = 0;  // user abort: pic->error_code is set by WebPReportProgress()
+    }
+    WebPMonitorLock(ctx->monitor);
+    if (!ok) {
+      ctx->abort = 1;
+    } else {
+      ctx->phase_end += ctx->rows_per_refresh;
+      if (ctx->phase_end > mb_h) ctx->phase_end = mb_h;
+    }
+    WebPMonitorBroadcast(ctx->monitor);
+    WebPMonitorUnlock(ctx->monitor);
+    if (!ok) break;
+  }
+
+  for (i = 1; i < ctx->num_threads; ++i) {
+    ok &= winterface->Sync(&ctx->threads[i - 1]);
+  }
+  VP8IteratorMergeMaxEdge(it);  // the workers merged theirs before Sync()
+  for (i = 0; i < ctx->num_threads; ++i) {
+    const VP8WavefrontWorker* const w = &ctx->workers[i];
+    *size_p0 += w->size_p0;
+    *distortion += w->distortion;
+    if (is_last_pass) MergeSideInfoSums(side_sums, &w->side_sums);
+  }
+  if (!ok && enc->pic->error_code == VP8_ENC_OK) {
+    WebPEncodingSetError(enc->pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
+  }
+  return ok;
+}
+
+static void WavefrontDelete(VP8WavefrontCtx* const ctx) {
+  if (ctx != NULL) {
+    const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
+    int i;
+    if (ctx->threads != NULL) {
+      for (i = 1; i < ctx->num_threads; ++i) {
+        winterface->End(&ctx->threads[i - 1]);
+      }
+      WebPSafeFree(ctx->threads);
+    }
+    if (ctx->row_tokens != NULL) {
+      for (i = 0; i < ctx->enc->mb_h; ++i) {
+        VP8TBufferClear(&ctx->row_tokens[i]);
+      }
+      WebPSafeFree(ctx->row_tokens);
+    }
+    WebPSafeFree(ctx->row_progress);
+    WebPSafeFree(ctx->workers);
+    WebPMonitorDelete(ctx->monitor);
+    WebPSafeFree(ctx);
+  }
+}
+
+// Creates the wavefront context, or returns NULL (e.g. when multi-threading
+// is not wanted or not available): the caller then uses the single-threaded
+// code path.
+static VP8WavefrontCtx* WavefrontNew(VP8Encoder* const enc,
+                                     int rows_per_refresh) {
+  const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
+  VP8WavefrontCtx* ctx = NULL;
+  int num_threads = WAVEFRONT_MAX_THREADS;
+  int i;
+  if (enc->thread_level <= 0) return NULL;
+  // The floating-point filter statistics would not accumulate in a defined
+  // order: leave auto-filter to the single-threaded loop.
+  if (enc->lf_stats != NULL) return NULL;
+  if (enc->mb_h < WAVEFRONT_MIN_MB_ROWS) return NULL;
+  if (num_threads > (enc->mb_h + 1) / 2) num_threads = (enc->mb_h + 1) / 2;
+
+  ctx = (VP8WavefrontCtx*)WebPSafeCalloc(1ULL, sizeof(*ctx));
+  if (ctx == NULL) return NULL;
+  ctx->enc = enc;
+  ctx->num_threads = num_threads;
+  ctx->rows_per_refresh = rows_per_refresh;
+  ctx->monitor = WebPMonitorNew();
+  ctx->row_tokens =
+      (VP8TBuffer*)WebPSafeCalloc(enc->mb_h, sizeof(*ctx->row_tokens));
+  ctx->row_progress =
+      (int*)WebPSafeCalloc(enc->mb_h, sizeof(*ctx->row_progress));
+  ctx->workers = (VP8WavefrontWorker*)WebPSafeCalloc(
+      num_threads, sizeof(*ctx->workers));
+  ctx->threads =
+      (WebPWorker*)WebPSafeCalloc(num_threads - 1, sizeof(*ctx->threads));
+  if (ctx->monitor == NULL || ctx->row_tokens == NULL ||
+      ctx->row_progress == NULL || ctx->workers == NULL ||
+      (num_threads > 1 && ctx->threads == NULL)) {
+    goto Error;
+  }
+  for (i = 0; i < enc->mb_h; ++i) {
+    VP8TBufferInit(&ctx->row_tokens[i], enc->mb_w * 16);
+  }
+  for (i = 0; i < num_threads; ++i) {
+    ctx->workers[i].ctx = ctx;
+  }
+  for (i = 1; i < num_threads; ++i) {
+    WebPWorker* const thread = &ctx->threads[i - 1];
+    winterface->Init(thread);
+    thread->data1 = &ctx->workers[i];
+    thread->data2 = NULL;
+    thread->hook = WavefrontWorkerHook;
+    if (!winterface->Reset(thread)) {
+      ctx->num_threads = i;  // only End() the threads reset so far
+      goto Error;
+    }
+  }
+  return ctx;
+
+ Error:
+  WavefrontDelete(ctx);
+  return NULL;
+}
+
+#endif  // WEBP_USE_THREAD
+
 int VP8EncTokenLoop(VP8Encoder* const enc) {
-  // Roughly refresh the proba eight times per pass
-  int max_count = (enc->mb_w * enc->mb_h) >> 3;
+  // Refresh the probas at row boundaries, roughly eight times per pass (and
+  // not before MIN_COUNT macroblocks): the refresh schedule only depends on
+  // the row so that the multi-threaded loop can reproduce it exactly.
+  int rows_per_refresh = enc->mb_h >> 3;
   int num_pass_left = enc->config->pass;
   int remaining_progress = 40;  // percents
   const int do_search = enc->do_search;
@@ -803,13 +1193,23 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
   const VP8RDLevel rd_opt = enc->rd_opt_level;
   const uint64_t pixel_count = (uint64_t)enc->mb_w * enc->mb_h * 384;
   PassStats stats;
+#ifdef WEBP_USE_THREAD
+  VP8WavefrontCtx* wavefront = NULL;
+#endif
   int ok;
 
   InitPassStats(enc, &stats);
   ok = PreLoopInitialize(enc);
   if (!ok) return 0;
 
-  if (max_count < MIN_COUNT) max_count = MIN_COUNT;
+  {
+    const int min_rows = (MIN_COUNT + enc->mb_w - 1) / enc->mb_w;
+    if (rows_per_refresh < min_rows) rows_per_refresh = min_rows;
+  }
+#ifdef WEBP_USE_THREAD
+  // returns NULL when multi-threading is off or not worth it
+  wavefront = WavefrontNew(enc, rows_per_refresh);
+#endif
 
   assert(enc->num_parts == 1);
   assert(enc->use_tokens);
@@ -823,7 +1223,7 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
                              (enc->max_i4_header_bits == 0);
     uint64_t size_p0 = 0;
     uint64_t distortion = 0;
-    int cnt = max_count;
+    SideInfoSums side_sums;
     // The final number of passes is not trivial to know in advance.
     const int pass_progress = remaining_progress / (2 + num_pass_left);
     remaining_progress -= pass_progress;
@@ -833,17 +1233,25 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
       ResetTokenStats(enc);
       VP8InitFilter(&it);  // don't collect stats until last pass (too costly)
     }
+    memset(&side_sums, 0, sizeof(side_sums));
+#ifdef WEBP_USE_THREAD
+    if (wavefront != NULL) {
+      ok = WavefrontOnePass(wavefront, &it, is_last_pass, rd_opt,
+                            pass_progress, &size_p0, &distortion, &side_sums);
+      if (!ok) break;
+      goto PassDone;
+    }
+#endif
     VP8TBufferClear(&enc->tokens);
     do {
       VP8ModeScore info;
-      VP8IteratorImport(&it, NULL);
-      if (--cnt < 0) {
+      if (it.x == 0 && it.y > 0 && (it.y % rows_per_refresh) == 0) {
         FinalizeTokenProbas(proba);
         VP8CalculateLevelCosts(proba);  // refresh cost tables for rd-opt
-        cnt = max_count;
       }
+      VP8IteratorImport(&it, NULL);
       VP8Decimate(&it, &info, rd_opt);
-      ok = RecordTokens(&it, &info, &enc->tokens);
+      ok = RecordTokens(&it, &info, &enc->tokens, proba->stats);
       if (!ok) {
         WebPEncodingSetError(enc->pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
         break;
@@ -851,7 +1259,7 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
       size_p0 += info.H;
       distortion += info.D;
       if (is_last_pass) {
-        StoreSideInfo(&it);
+        StoreSideInfo(&it, &side_sums);
         VP8StoreFilterStats(&it);
         VP8IteratorExport(&it);
         ok = VP8IteratorProgress(&it, pass_progress);
@@ -859,11 +1267,27 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
       VP8IteratorSaveBoundary(&it);
     } while (ok && VP8IteratorNext(&it));
     if (!ok) break;
+    VP8IteratorMergeMaxEdge(&it);
 
+#ifdef WEBP_USE_THREAD
+  PassDone:
+#endif
     size_p0 += enc->segment_hdr.size;
     if (stats.do_size_search) {
       uint64_t size = FinalizeTokenProbas(&enc->proba);
-      size += VP8EstimateTokenSize(&enc->tokens, (const uint8_t*)proba->coeffs);
+#ifdef WEBP_USE_THREAD
+      if (wavefront != NULL) {
+        int y;
+        for (y = 0; y < enc->mb_h; ++y) {
+          size += VP8EstimateTokenSize(&wavefront->row_tokens[y],
+                                       (const uint8_t*)proba->coeffs);
+        }
+      } else
+#endif
+      {
+        size +=
+            VP8EstimateTokenSize(&enc->tokens, (const uint8_t*)proba->coeffs);
+      }
       size = (size + size_p0 + 1024) >> 11;  // -> size in bytes
       size += HEADER_SIZE_ESTIMATE;
       stats.value = (double)size;
@@ -887,6 +1311,7 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
       continue;  // ...and start over
     }
     if (is_last_pass) {
+      ApplySideInfoSums(enc, &side_sums);
       break;  // done
     }
     if (do_search) {
@@ -897,9 +1322,23 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
     if (!stats.do_size_search) {
       FinalizeTokenProbas(&enc->proba);
     }
-    ok = VP8EmitTokens(&enc->tokens, enc->parts + 0,
-                       (const uint8_t*)proba->coeffs, 1);
+#ifdef WEBP_USE_THREAD
+    if (wavefront != NULL) {
+      int y;
+      for (y = 0; ok && y < enc->mb_h; ++y) {
+        ok = VP8EmitTokens(&wavefront->row_tokens[y], enc->parts + 0,
+                           (const uint8_t*)proba->coeffs, 1);
+      }
+    } else
+#endif
+    {
+      ok = VP8EmitTokens(&enc->tokens, enc->parts + 0,
+                         (const uint8_t*)proba->coeffs, 1);
+    }
   }
+#ifdef WEBP_USE_THREAD
+  WavefrontDelete(wavefront);
+#endif
   ok = ok && WebPReportProgress(enc->pic, enc->percent + remaining_progress,
                                 &enc->percent);
   return PostLoopFinalize(&it, ok);

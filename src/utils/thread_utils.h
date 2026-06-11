@@ -85,6 +85,23 @@ WEBP_EXTERN int WebPSetWorkerInterface(
 WEBP_EXTERN const WebPWorkerInterface* WebPGetWorkerInterface(void);
 
 //------------------------------------------------------------------------------
+// Lightweight monitor (a mutex paired with a condition variable), for
+// fine-grained synchronization between workers (e.g. wavefront encoding).
+
+// Allocates and initializes a monitor. Returns NULL on error or if threading
+// is disabled at compile time.
+WEBP_EXTERN void* WebPMonitorNew(void);
+// Deletes a monitor created by WebPMonitorNew(). 'monitor' can be NULL.
+WEBP_EXTERN void WebPMonitorDelete(void* monitor);
+WEBP_EXTERN void WebPMonitorLock(void* monitor);
+WEBP_EXTERN void WebPMonitorUnlock(void* monitor);
+// Atomically releases the lock and waits for WebPMonitorBroadcast(). The lock
+// is re-acquired before returning. The monitor lock must be held.
+WEBP_EXTERN void WebPMonitorWait(void* monitor);
+// Wakes up all the threads waiting on the monitor.
+WEBP_EXTERN void WebPMonitorBroadcast(void* monitor);
+
+//------------------------------------------------------------------------------
 
 #ifdef __cplusplus
 }  // extern "C"
