@@ -52,14 +52,25 @@ static void CollectHistogram_SSE41(const uint8_t* WEBP_RESTRICT ref,
       // bin = min(v, MAX_COEFF_THRESH)
       const __m128i bin0 = _mm_min_epi16(v0, max_coeff_thresh);
       const __m128i bin1 = _mm_min_epi16(v1, max_coeff_thresh);
-      // Store.
-      _mm_storeu_si128((__m128i*)&out[0], bin0);
-      _mm_storeu_si128((__m128i*)&out[8], bin1);
-    }
-
-    // Convert coefficients to bin.
-    for (k = 0; k < 16; ++k) {
-      ++distribution[out[k]];
+      // Convert coefficients to bin: extract the 16 clamped values (they fit
+      // in 8 bits) to general purpose registers; identical values (the
+      // typical case: most coefficients are zero) are added in one go to
+      // avoid a load-add-store dependency chain on a single bin.
+      const __m128i bins = _mm_packus_epi16(bin0, bin1);
+      const uint64_t lo =
+          (uint32_t)_mm_cvtsi128_si32(bins) |
+          ((uint64_t)(uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(bins, 4))
+           << 32);
+      const uint64_t hi =
+          (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(bins, 8)) |
+          ((uint64_t)(uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(bins, 12))
+           << 32);
+      if (lo == hi && lo == ((lo >> 8) | (lo << 56))) {  // 16 equal values
+        distribution[lo & 0xff] += 16;
+      } else {
+        for (k = 0; k < 8; ++k) ++distribution[(lo >> (8 * k)) & 0xff];
+        for (k = 0; k < 8; ++k) ++distribution[(hi >> (8 * k)) & 0xff];
+      }
     }
   }
   VP8SetHistogramData(distribution, histo);

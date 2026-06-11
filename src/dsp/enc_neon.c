@@ -735,11 +735,19 @@ static void CollectHistogram_NEON(const uint8_t* WEBP_RESTRICT ref,
       const uint16x8_t b2 = vshrq_n_u16(b1, 3);
       const uint16x8_t a3 = vminq_u16(a2, max_coeff_thresh);
       const uint16x8_t b3 = vminq_u16(b2, max_coeff_thresh);
-      vst1q_s16(out + 0, vreinterpretq_s16_u16(a3));
-      vst1q_s16(out + 8, vreinterpretq_s16_u16(b3));
-      // Convert coefficients to bin.
-      for (k = 0; k < 16; ++k) {
-        ++distribution[out[k]];
+      // Convert coefficients to bin: extract the 16 clamped values (they fit
+      // in 8 bits) to general purpose registers; identical values (the
+      // typical case: most coefficients are zero) are added in one go to
+      // avoid a load-add-store dependency chain on a single bin.
+      const uint8x16_t bins = vcombine_u8(vmovn_u16(a3), vmovn_u16(b3));
+      const uint64x2_t packed = vreinterpretq_u64_u8(bins);
+      const uint64_t lo = vgetq_lane_u64(packed, 0);
+      const uint64_t hi = vgetq_lane_u64(packed, 1);
+      if (lo == hi && lo == ((lo >> 8) | (lo << 56))) {  // 16 equal values
+        distribution[lo & 0xff] += 16;
+      } else {
+        for (k = 0; k < 8; ++k) ++distribution[(lo >> (8 * k)) & 0xff];
+        for (k = 0; k < 8; ++k) ++distribution[(hi >> (8 * k)) & 0xff];
       }
     }
   }
