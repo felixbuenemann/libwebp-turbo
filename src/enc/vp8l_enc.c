@@ -773,8 +773,8 @@ static int EncodeImageNoHuffman(VP8LBitWriter* const bw,
   }
   if (!VP8LGetBackwardReferences(width, height, argb, quality, /*low_effort=*/0,
                                  kLZ77Standard | kLZ77RLE, cache_bits,
-                                 /*do_no_cache=*/0, hash_chain, refs_array,
-                                 &cache_bits, pic,
+                                 /*do_no_cache=*/0, /*use_threads=*/0,
+                                 hash_chain, refs_array, &cache_bits, pic,
                                  percent_range - percent_range / 2, percent)) {
     goto Error;
   }
@@ -912,7 +912,7 @@ static int EncodeImageInternal(
 
     if (!VP8LGetBackwardReferences(
             width, height, argb, quality, low_effort, sub_config->lz77,
-            cache_bits_init, sub_config->do_no_cache, hash_chain,
+            cache_bits_init, sub_config->do_no_cache, use_threads, hash_chain,
             &refs_array[0], &cache_bits_best, pic, i_percent_range, percent)) {
       goto Error;
     }

@@ -1052,89 +1052,187 @@ extern int VP8LBackwardReferencesTraceBackwards(
     int xsize, int ysize, const uint32_t* const argb, int cache_bits,
     const VP8LHashChain* const hash_chain,
     const VP8LBackwardRefs* const refs_src, VP8LBackwardRefs* const refs_dst);
+
+// One LZ77 variant evaluation: computes the backward references of the
+// variant and their bit costs with and without a color cache. The jobs are
+// independent of each other and can run on separate threads; the (strictly
+// ordered) comparison of their costs is done by the caller afterwards.
+typedef struct {
+  // Input.
+  int lz77_type;
+  int width, height;
+  const uint32_t* argb;
+  int quality;
+  int cache_bits_max;
+  int do_no_cache;
+  const VP8LHashChain* hash_chain;
+  // Output.
+  VP8LBackwardRefs refs_raw;     // references without a color cache
+  VP8LBackwardRefs refs_cached;  // references with the best color cache
+  VP8LHashChain hash_chain_box;  // only used by kLZ77Box
+  int cache_bits;                // best color cache size (0 = none)
+  uint64_t bit_cost[2];          // cost with ([0]) and without ([1]) cache
+  int ok;
+} LZ77Job;
+
+static int RunLZ77Job(LZ77Job* const job) {
+  const int width = job->width, height = job->height;
+  const uint32_t* const argb = job->argb;
+  VP8LHistogram* const histo = VP8LAllocateHistogram(MAX_COLOR_CACHE_BITS);
+  uint64_t bit_cost = 0u;
+  int res = 0;
+  job->ok = 0;
+  if (histo == NULL) return 0;
+  switch (job->lz77_type) {
+    case kLZ77RLE:
+      res = BackwardReferencesRle(width, height, argb, 0, &job->refs_raw);
+      break;
+    case kLZ77Standard:
+      // Compute LZ77 with no cache (0 bits), as the ideal LZ77 with a color
+      // cache is not that different in practice.
+      res = BackwardReferencesLz77(width, height, argb, 0, job->hash_chain,
+                                   &job->refs_raw);
+      break;
+    case kLZ77Box:
+      if (!VP8LHashChainInit(&job->hash_chain_box, width * height)) goto End;
+      res = BackwardReferencesLz77Box(width, height, argb, 0, job->hash_chain,
+                                      &job->hash_chain_box, &job->refs_raw);
+      break;
+    default:
+      assert(0);
+  }
+  if (!res) goto End;
+
+  // Start with the no color cache case.
+  if (job->do_no_cache) {
+    VP8LHistogramCreate(histo, &job->refs_raw, /*cache_bits=*/0);
+    bit_cost = VP8LHistogramEstimateBits(histo);
+    job->bit_cost[1] = bit_cost;
+  }
+  // Try with a color cache.
+  job->cache_bits = job->cache_bits_max;
+  if (!CalculateBestCacheSize(argb, job->quality, &job->refs_raw,
+                              &job->cache_bits)) {
+    goto End;
+  }
+  if (!BackwardRefsClone(&job->refs_raw, &job->refs_cached)) goto End;
+  if (job->cache_bits > 0) {
+    if (!BackwardRefsWithLocalCache(argb, job->cache_bits,
+                                    &job->refs_cached)) {
+      goto End;
+    }
+  }
+  if (job->do_no_cache && job->cache_bits == 0) {
+    // No need to re-compute bit_cost as it was computed without a cache.
+    job->bit_cost[0] = bit_cost;
+  } else {
+    VP8LHistogramCreate(histo, &job->refs_cached, job->cache_bits);
+    job->bit_cost[0] = VP8LHistogramEstimateBits(histo);
+  }
+  job->ok = 1;
+
+ End:
+  VP8LFreeHistogram(histo);
+  return job->ok;
+}
+
+#ifdef WEBP_USE_THREAD
+static int LZ77JobHook(void* arg1, void* arg2) {
+  (void)arg2;
+  return RunLZ77Job((LZ77Job*)arg1);
+}
+#endif
+
 static int GetBackwardReferences(int width, int height,
                                  const uint32_t* const argb, int quality,
                                  int lz77_types_to_try, int cache_bits_max,
-                                 int do_no_cache,
+                                 int do_no_cache, int use_threads,
                                  const VP8LHashChain* const hash_chain,
                                  VP8LBackwardRefs* const refs,
                                  int* const cache_bits_best) {
-  VP8LHistogram* histo = NULL;
   int i, lz77_type;
   // Index 0 is for a color cache, index 1 for no cache (if needed).
   int lz77_types_best[2] = {0, 0};
   uint64_t bit_costs_best[2] = {WEBP_UINT64_MAX, WEBP_UINT64_MAX};
-  VP8LHashChain hash_chain_box;
+  const VP8LHashChain* hash_chain_box = NULL;
   VP8LBackwardRefs* const refs_tmp = &refs[do_no_cache ? 2 : 1];
   int status = 0;
-  memset(&hash_chain_box, 0, sizeof(hash_chain_box));
-
-  histo = VP8LAllocateHistogram(MAX_COLOR_CACHE_BITS);
-  if (histo == NULL) goto Error;
+  LZ77Job jobs[3];
+  int num_jobs = 0;
 
   for (lz77_type = 1; lz77_types_to_try;
        lz77_types_to_try &= ~lz77_type, lz77_type <<= 1) {
-    int res = 0;
-    uint64_t bit_cost = 0u;
+    LZ77Job* job;
     if ((lz77_types_to_try & lz77_type) == 0) continue;
-    switch (lz77_type) {
-      case kLZ77RLE:
-        res = BackwardReferencesRle(width, height, argb, 0, refs_tmp);
-        break;
-      case kLZ77Standard:
-        // Compute LZ77 with no cache (0 bits), as the ideal LZ77 with a color
-        // cache is not that different in practice.
-        res = BackwardReferencesLz77(width, height, argb, 0, hash_chain,
-                                     refs_tmp);
-        break;
-      case kLZ77Box:
-        if (!VP8LHashChainInit(&hash_chain_box, width * height)) goto Error;
-        res = BackwardReferencesLz77Box(width, height, argb, 0, hash_chain,
-                                        &hash_chain_box, refs_tmp);
-        break;
-      default:
-        assert(0);
-    }
-    if (!res) goto Error;
+    job = &jobs[num_jobs++];
+    memset(job, 0, sizeof(*job));
+    job->lz77_type = lz77_type;
+    job->width = width;
+    job->height = height;
+    job->argb = argb;
+    job->quality = quality;
+    job->cache_bits_max = cache_bits_max;
+    job->do_no_cache = do_no_cache;
+    job->hash_chain = hash_chain;
+    VP8LBackwardRefsInit(&job->refs_raw, refs[0].block_size);
+    VP8LBackwardRefsInit(&job->refs_cached, refs[0].block_size);
+  }
+  assert(num_jobs > 0);
 
+#ifdef WEBP_USE_THREAD
+  if (use_threads && num_jobs > 1) {
+    // Run the last jobs on worker threads, the first one on this thread.
+    const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
+    WebPWorker threads[2];
+    int num_threads = 0;
+    int main_ok;
+    for (i = 1; i < num_jobs; ++i) {
+      WebPWorker* const thread = &threads[i - 1];
+      winterface->Init(thread);
+      thread->data1 = &jobs[i];
+      thread->data2 = NULL;
+      thread->hook = LZ77JobHook;
+      if (!winterface->Reset(thread)) break;
+      ++num_threads;
+      winterface->Launch(thread);
+    }
+    for (i = num_threads + 1; i < num_jobs; ++i) {
+      RunLZ77Job(&jobs[i]);  // threads that could not start
+    }
+    main_ok = RunLZ77Job(&jobs[0]);
+    for (i = 0; i < num_threads; ++i) {
+      winterface->Sync(&threads[i]);
+      winterface->End(&threads[i]);
+    }
+    if (!main_ok) goto Error;
+  } else
+#else
+  (void)use_threads;
+#endif
+  {
+    for (i = 0; i < num_jobs; ++i) {
+      if (!RunLZ77Job(&jobs[i])) goto Error;
+    }
+  }
+
+  // Compare the variants, in the same order as the single-threaded
+  // evaluation.
+  for (i = 0; i < num_jobs; ++i) {
+    LZ77Job* const job = &jobs[i];
+    int j;
+    if (!job->ok) goto Error;
     // Start with the no color cache case.
-    for (i = 1; i >= 0; --i) {
-      int cache_bits = (i == 1) ? 0 : cache_bits_max;
-
-      if (i == 1 && !do_no_cache) continue;
-
-      if (i == 0) {
-        // Try with a color cache.
-        if (!CalculateBestCacheSize(argb, quality, refs_tmp, &cache_bits)) {
-          goto Error;
-        }
-        if (cache_bits > 0) {
-          if (!BackwardRefsWithLocalCache(argb, cache_bits, refs_tmp)) {
-            goto Error;
-          }
-        }
-      }
-
-      if (i == 0 && do_no_cache && cache_bits == 0) {
-        // No need to re-compute bit_cost as it was computed at i == 1.
-      } else {
-        VP8LHistogramCreate(histo, refs_tmp, cache_bits);
-        bit_cost = VP8LHistogramEstimateBits(histo);
-      }
-
-      if (bit_cost < bit_costs_best[i]) {
-        if (i == 1) {
-          // Do not swap as the full cache analysis would have the wrong
-          // VP8LBackwardRefs to start with.
-          if (!BackwardRefsClone(refs_tmp, &refs[1])) goto Error;
-        } else {
-          BackwardRefsSwap(refs_tmp, &refs[0]);
-        }
-        bit_costs_best[i] = bit_cost;
-        lz77_types_best[i] = lz77_type;
-        if (i == 0) *cache_bits_best = cache_bits;
+    for (j = 1; j >= 0; --j) {
+      if (j == 1 && !do_no_cache) continue;
+      if (job->bit_cost[j] < bit_costs_best[j]) {
+        BackwardRefsSwap((j == 1) ? &job->refs_raw : &job->refs_cached,
+                         &refs[j]);
+        bit_costs_best[j] = job->bit_cost[j];
+        lz77_types_best[j] = job->lz77_type;
+        if (j == 0) *cache_bits_best = job->cache_bits;
       }
     }
+    if (job->lz77_type == kLZ77Box) hash_chain_box = &job->hash_chain_box;
   }
   assert(lz77_types_best[0] > 0);
   assert(!do_no_cache || lz77_types_best[1] > 0);
@@ -1147,16 +1245,20 @@ static int GetBackwardReferences(int width, int height,
          lz77_types_best[i] == kLZ77Box) &&
         quality >= 25) {
       const VP8LHashChain* const hash_chain_tmp =
-          (lz77_types_best[i] == kLZ77Standard) ? hash_chain : &hash_chain_box;
+          (lz77_types_best[i] == kLZ77Standard) ? hash_chain : hash_chain_box;
       const int cache_bits = (i == 1) ? 0 : *cache_bits_best;
       uint64_t bit_cost_trace;
+      VP8LHistogram* const histo = VP8LAllocateHistogram(MAX_COLOR_CACHE_BITS);
+      if (histo == NULL) goto Error;
       if (!VP8LBackwardReferencesTraceBackwards(width, height, argb, cache_bits,
                                                 hash_chain_tmp, &refs[i],
                                                 refs_tmp)) {
+        VP8LFreeHistogram(histo);
         goto Error;
       }
       VP8LHistogramCreate(histo, refs_tmp, cache_bits);
       bit_cost_trace = VP8LHistogramEstimateBits(histo);
+      VP8LFreeHistogram(histo);
       if (bit_cost_trace < bit_costs_best[i]) {
         BackwardRefsSwap(refs_tmp, &refs[i]);
       }
@@ -1175,17 +1277,20 @@ static int GetBackwardReferences(int width, int height,
   status = 1;
 
 Error:
-  VP8LHashChainClear(&hash_chain_box);
-  VP8LFreeHistogram(histo);
+  for (i = 0; i < num_jobs; ++i) {
+    VP8LBackwardRefsClear(&jobs[i].refs_raw);
+    VP8LBackwardRefsClear(&jobs[i].refs_cached);
+    VP8LHashChainClear(&jobs[i].hash_chain_box);
+  }
   return status;
 }
 
 int VP8LGetBackwardReferences(
     int width, int height, const uint32_t* const argb, int quality,
     int low_effort, int lz77_types_to_try, int cache_bits_max, int do_no_cache,
-    const VP8LHashChain* const hash_chain, VP8LBackwardRefs* const refs,
-    int* const cache_bits_best, const WebPPicture* const pic, int percent_range,
-    int* const percent) {
+    int use_threads, const VP8LHashChain* const hash_chain,
+    VP8LBackwardRefs* const refs, int* const cache_bits_best,
+    const WebPPicture* const pic, int percent_range, int* const percent) {
   if (low_effort) {
     VP8LBackwardRefs* refs_best;
     *cache_bits_best = cache_bits_max;
@@ -1198,8 +1303,8 @@ int VP8LGetBackwardReferences(
     BackwardRefsSwap(refs_best, &refs[0]);
   } else {
     if (!GetBackwardReferences(width, height, argb, quality, lz77_types_to_try,
-                               cache_bits_max, do_no_cache, hash_chain, refs,
-                               cache_bits_best)) {
+                               cache_bits_max, do_no_cache, use_threads,
+                               hash_chain, refs, cache_bits_best)) {
       return WebPEncodingSetError(pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
     }
   }

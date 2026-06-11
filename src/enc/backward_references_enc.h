@@ -228,9 +228,9 @@ enum VP8LLZ77Type { kLZ77Standard = 1, kLZ77RLE = 2, kLZ77Box = 4 };
 int VP8LGetBackwardReferences(
     int width, int height, const uint32_t* const argb, int quality,
     int low_effort, int lz77_types_to_try, int cache_bits_max, int do_no_cache,
-    const VP8LHashChain* const hash_chain, VP8LBackwardRefs* const refs,
-    int* const cache_bits_best, const WebPPicture* const pic, int percent_range,
-    int* const percent);
+    int use_threads, const VP8LHashChain* const hash_chain,
+    VP8LBackwardRefs* const refs, int* const cache_bits_best,
+    const WebPPicture* const pic, int percent_range, int* const percent);
 
 #ifdef __cplusplus
 }
