@@ -111,6 +111,7 @@ static WEBP_INLINE void Load4x16_NEON(const uint8_t* src, int stride,
 
 #endif  // !WORK_AROUND_GCC
 
+#if !WEBP_AARCH64
 static WEBP_INLINE void Load8x16_NEON(
     const uint8_t* const src, int stride, uint8x16_t* const p3,
     uint8x16_t* const p2, uint8x16_t* const p1, uint8x16_t* const p0,
@@ -119,6 +120,8 @@ static WEBP_INLINE void Load8x16_NEON(
   Load4x16_NEON(src - 2, stride, p3, p2, p1, p0);
   Load4x16_NEON(src + 2, stride, q0, q1, q2, q3);
 }
+
+#endif  // !WEBP_AARCH64
 
 static WEBP_INLINE void Load16x4_NEON(const uint8_t* const src, int stride,
                                       uint8x16_t* const p1,
@@ -244,7 +247,7 @@ static WEBP_INLINE void Store2x16_NEON(const uint8x16_t p0, const uint8x16_t q0,
   Store2x8_NEON(hi, dst - 1 + 8 * stride, stride);
 }
 
-#if !defined(WORK_AROUND_GCC)
+#if !defined(WORK_AROUND_GCC) && !WEBP_AARCH64
 static WEBP_INLINE void Store4x8_NEON(const uint8x8x4_t v, uint8_t* const dst,
                                       int stride) {
   vst4_lane_u8(dst + 0 * stride, v, 0);
@@ -268,7 +271,7 @@ static WEBP_INLINE void Store4x16_NEON(const uint8x16_t p1, const uint8x16_t p0,
   Store4x8_NEON(lo, dst - 2 + 0 * stride, stride);
   Store4x8_NEON(hi, dst - 2 + 8 * stride, stride);
 }
-#endif  // !WORK_AROUND_GCC
+#endif  // !WORK_AROUND_GCC && !WEBP_AARCH64
 
 static WEBP_INLINE void Store16x2_NEON(const uint8x16_t p0, const uint8x16_t q0,
                                        uint8_t* const dst, int stride) {
@@ -303,7 +306,7 @@ static WEBP_INLINE void Store8x4x2_NEON(const uint8x16_t p1,
   Store8x2x2_NEON(q0, q1, u + stride, v + stride, stride);
 }
 
-#if !defined(WORK_AROUND_GCC)
+#if !defined(WORK_AROUND_GCC) && !WEBP_AARCH64
 
 #define STORE6_LANE(DST, VAL0, VAL1, LANE)   \
   do {                                       \
@@ -845,6 +848,115 @@ static void VFilter16_NEON(uint8_t* p, int stride, int thresh, int ithresh,
   }
 }
 
+#if WEBP_AARCH64
+
+// Transposes the 8x8 byte block whose rows are in 'row', in place.
+static WEBP_INLINE void Transpose8x8_NEON(uint8x8_t row[8]) {
+  const uint8x8x2_t a0 = vtrn_u8(row[0], row[1]);
+  const uint8x8x2_t a1 = vtrn_u8(row[2], row[3]);
+  const uint8x8x2_t a2 = vtrn_u8(row[4], row[5]);
+  const uint8x8x2_t a3 = vtrn_u8(row[6], row[7]);
+  const uint16x4x2_t b0 = vtrn_u16(vreinterpret_u16_u8(a0.val[0]),
+                                   vreinterpret_u16_u8(a1.val[0]));
+  const uint16x4x2_t b1 = vtrn_u16(vreinterpret_u16_u8(a0.val[1]),
+                                   vreinterpret_u16_u8(a1.val[1]));
+  const uint16x4x2_t b2 = vtrn_u16(vreinterpret_u16_u8(a2.val[0]),
+                                   vreinterpret_u16_u8(a3.val[0]));
+  const uint16x4x2_t b3 = vtrn_u16(vreinterpret_u16_u8(a2.val[1]),
+                                   vreinterpret_u16_u8(a3.val[1]));
+  const uint32x2x2_t c0 = vtrn_u32(vreinterpret_u32_u16(b0.val[0]),
+                                   vreinterpret_u32_u16(b2.val[0]));
+  const uint32x2x2_t c1 = vtrn_u32(vreinterpret_u32_u16(b1.val[0]),
+                                   vreinterpret_u32_u16(b3.val[0]));
+  const uint32x2x2_t c2 = vtrn_u32(vreinterpret_u32_u16(b0.val[1]),
+                                   vreinterpret_u32_u16(b2.val[1]));
+  const uint32x2x2_t c3 = vtrn_u32(vreinterpret_u32_u16(b1.val[1]),
+                                   vreinterpret_u32_u16(b3.val[1]));
+  row[0] = vreinterpret_u8_u32(c0.val[0]);
+  row[1] = vreinterpret_u8_u32(c1.val[0]);
+  row[2] = vreinterpret_u8_u32(c2.val[0]);
+  row[3] = vreinterpret_u8_u32(c3.val[0]);
+  row[4] = vreinterpret_u8_u32(c0.val[1]);
+  row[5] = vreinterpret_u8_u32(c1.val[1]);
+  row[6] = vreinterpret_u8_u32(c2.val[1]);
+  row[7] = vreinterpret_u8_u32(c3.val[1]);
+}
+
+// Loads the 16x8 block starting at 'src' with plain row loads and transposes
+// it into the eight 16-tall columns 'p3' ... 'q3'. This is much cheaper than
+// gathering the columns with lane loads.
+static WEBP_INLINE void Load8ColumnsT_NEON(
+    const uint8_t* const src, int stride, uint8x16_t* const p3,
+    uint8x16_t* const p2, uint8x16_t* const p1, uint8x16_t* const p0,
+    uint8x16_t* const q0, uint8x16_t* const q1, uint8x16_t* const q2,
+    uint8x16_t* const q3) {
+  uint8x8_t lo[8], hi[8];
+  int i;
+  for (i = 0; i < 8; ++i) {
+    lo[i] = vld1_u8(src + (i + 0) * stride);
+    hi[i] = vld1_u8(src + (i + 8) * stride);
+  }
+  Transpose8x8_NEON(lo);
+  Transpose8x8_NEON(hi);
+  *p3 = vcombine_u8(lo[0], hi[0]);
+  *p2 = vcombine_u8(lo[1], hi[1]);
+  *p1 = vcombine_u8(lo[2], hi[2]);
+  *p0 = vcombine_u8(lo[3], hi[3]);
+  *q0 = vcombine_u8(lo[4], hi[4]);
+  *q1 = vcombine_u8(lo[5], hi[5]);
+  *q2 = vcombine_u8(lo[6], hi[6]);
+  *q3 = vcombine_u8(lo[7], hi[7]);
+}
+
+// Reverse operation: transposes the eight 16-tall columns back and stores the
+// 16x8 block with plain row stores ('p3' and 'q3' hold unmodified samples).
+static WEBP_INLINE void Store8ColumnsT_NEON(
+    const uint8x16_t p3, const uint8x16_t p2, const uint8x16_t p1,
+    const uint8x16_t p0, const uint8x16_t q0, const uint8x16_t q1,
+    const uint8x16_t q2, const uint8x16_t q3, uint8_t* const dst, int stride) {
+  uint8x8_t lo[8], hi[8];
+  int i;
+  lo[0] = vget_low_u8(p3);
+  lo[1] = vget_low_u8(p2);
+  lo[2] = vget_low_u8(p1);
+  lo[3] = vget_low_u8(p0);
+  lo[4] = vget_low_u8(q0);
+  lo[5] = vget_low_u8(q1);
+  lo[6] = vget_low_u8(q2);
+  lo[7] = vget_low_u8(q3);
+  hi[0] = vget_high_u8(p3);
+  hi[1] = vget_high_u8(p2);
+  hi[2] = vget_high_u8(p1);
+  hi[3] = vget_high_u8(p0);
+  hi[4] = vget_high_u8(q0);
+  hi[5] = vget_high_u8(q1);
+  hi[6] = vget_high_u8(q2);
+  hi[7] = vget_high_u8(q3);
+  Transpose8x8_NEON(lo);
+  Transpose8x8_NEON(hi);
+  for (i = 0; i < 8; ++i) {
+    vst1_u8(dst + (i + 0) * stride, lo[i]);
+    vst1_u8(dst + (i + 8) * stride, hi[i]);
+  }
+}
+
+static void HFilter16_NEON(uint8_t* p, int stride, int thresh, int ithresh,
+                           int hev_thresh) {
+  uint8x16_t p3, p2, p1, p0, q0, q1, q2, q3;
+  Load8ColumnsT_NEON(p - 4, stride, &p3, &p2, &p1, &p0, &q0, &q1, &q2, &q3);
+  {
+    const uint8x16_t mask =
+        NeedsFilter2_NEON(p3, p2, p1, p0, q0, q1, q2, q3, ithresh, thresh);
+    const uint8x16_t hev_mask = NeedsHev_NEON(p1, p0, q0, q1, hev_thresh);
+    uint8x16_t op2, op1, op0, oq0, oq1, oq2;
+    DoFilter6_NEON(p2, p1, p0, q0, q1, q2, mask, hev_mask, &op2, &op1, &op0,
+                   &oq0, &oq1, &oq2);
+    Store8ColumnsT_NEON(p3, op2, op1, op0, oq0, oq1, oq2, q3, p - 4, stride);
+  }
+}
+
+#else  // !WEBP_AARCH64
+
 static void HFilter16_NEON(uint8_t* p, int stride, int thresh, int ithresh,
                            int hev_thresh) {
   uint8x16_t p3, p2, p1, p0, q0, q1, q2, q3;
@@ -861,6 +973,8 @@ static void HFilter16_NEON(uint8_t* p, int stride, int thresh, int ithresh,
     Store2x16_NEON(oq1, oq2, p + 2, stride);
   }
 }
+
+#endif  // WEBP_AARCH64
 
 // on three inner edges
 static void VFilter16i_NEON(uint8_t* p, int stride, int thresh, int ithresh,
@@ -886,7 +1000,35 @@ static void VFilter16i_NEON(uint8_t* p, int stride, int thresh, int ithresh,
   }
 }
 
-#if !defined(WORK_AROUND_GCC)
+#if WEBP_AARCH64
+static void HFilter16i_NEON(uint8_t* p, int stride, int thresh, int ithresh,
+                            int hev_thresh) {
+  // Work on the whole 16x16 macroblock in registers: load and transpose the
+  // 16 columns once, filter the three inner edges in place (each edge reads
+  // samples modified by the previous one, as in the sequential version) and
+  // transpose back.
+  uint8x16_t c[16];
+  uint32_t k;
+  Load8ColumnsT_NEON(p + 0, stride, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5],
+                     &c[6], &c[7]);
+  Load8ColumnsT_NEON(p + 8, stride, &c[8], &c[9], &c[10], &c[11], &c[12],
+                     &c[13], &c[14], &c[15]);
+  for (k = 0; k < 3; ++k) {
+    uint8x16_t* const e = c + 4 * k;  // p3 = e[0] ... q3 = e[7]
+    const uint8x16_t mask = NeedsFilter2_NEON(e[0], e[1], e[2], e[3], e[4],
+                                              e[5], e[6], e[7], ithresh,
+                                              thresh);
+    const uint8x16_t hev_mask =
+        NeedsHev_NEON(e[2], e[3], e[4], e[5], hev_thresh);
+    DoFilter4_NEON(e[2], e[3], e[4], e[5], mask, hev_mask, &e[2], &e[3], &e[4],
+                   &e[5]);
+  }
+  Store8ColumnsT_NEON(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], p + 0,
+                      stride);
+  Store8ColumnsT_NEON(c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15],
+                      p + 8, stride);
+}
+#elif !defined(WORK_AROUND_GCC)
 static void HFilter16i_NEON(uint8_t* p, int stride, int thresh, int ithresh,
                             int hev_thresh) {
   uint32_t k;
@@ -907,7 +1049,7 @@ static void HFilter16i_NEON(uint8_t* p, int stride, int thresh, int ithresh,
     }
   }
 }
-#endif  // !WORK_AROUND_GCC
+#endif  // WEBP_AARCH64 / !WORK_AROUND_GCC
 
 // 8-pixels wide variant, for chroma filtering
 static void VFilter8_NEON(uint8_t* WEBP_RESTRICT u, uint8_t* WEBP_RESTRICT v,
@@ -943,7 +1085,75 @@ static void VFilter8i_NEON(uint8_t* WEBP_RESTRICT u, uint8_t* WEBP_RESTRICT v,
   }
 }
 
-#if !defined(WORK_AROUND_GCC)
+#if WEBP_AARCH64
+
+// Reverse operation of Load8x8x2T_NEON(): transposes the eight 8-tall
+// u (low halves) and v (high halves) columns back and stores the two 8x8
+// blocks with plain row stores ('p3' and 'q3' hold unmodified samples).
+static WEBP_INLINE void Store8x8x2T_NEON(
+    const uint8x16_t p3, const uint8x16_t p2, const uint8x16_t p1,
+    const uint8x16_t p0, const uint8x16_t q0, const uint8x16_t q1,
+    const uint8x16_t q2, const uint8x16_t q3, uint8_t* WEBP_RESTRICT const u,
+    uint8_t* WEBP_RESTRICT const v, int stride) {
+  uint8x8_t cu[8], cv[8];
+  int i;
+  cu[0] = vget_low_u8(p3);
+  cu[1] = vget_low_u8(p2);
+  cu[2] = vget_low_u8(p1);
+  cu[3] = vget_low_u8(p0);
+  cu[4] = vget_low_u8(q0);
+  cu[5] = vget_low_u8(q1);
+  cu[6] = vget_low_u8(q2);
+  cu[7] = vget_low_u8(q3);
+  cv[0] = vget_high_u8(p3);
+  cv[1] = vget_high_u8(p2);
+  cv[2] = vget_high_u8(p1);
+  cv[3] = vget_high_u8(p0);
+  cv[4] = vget_high_u8(q0);
+  cv[5] = vget_high_u8(q1);
+  cv[6] = vget_high_u8(q2);
+  cv[7] = vget_high_u8(q3);
+  Transpose8x8_NEON(cu);
+  Transpose8x8_NEON(cv);
+  for (i = 0; i < 8; ++i) {
+    vst1_u8(u - 4 + i * stride, cu[i]);
+    vst1_u8(v - 4 + i * stride, cv[i]);
+  }
+}
+
+static void HFilter8_NEON(uint8_t* WEBP_RESTRICT u, uint8_t* WEBP_RESTRICT v,
+                          int stride, int thresh, int ithresh, int hev_thresh) {
+  uint8x16_t p3, p2, p1, p0, q0, q1, q2, q3;
+  Load8x8x2T_NEON(u, v, stride, &p3, &p2, &p1, &p0, &q0, &q1, &q2, &q3);
+  {
+    const uint8x16_t mask =
+        NeedsFilter2_NEON(p3, p2, p1, p0, q0, q1, q2, q3, ithresh, thresh);
+    const uint8x16_t hev_mask = NeedsHev_NEON(p1, p0, q0, q1, hev_thresh);
+    uint8x16_t op2, op1, op0, oq0, oq1, oq2;
+    DoFilter6_NEON(p2, p1, p0, q0, q1, q2, mask, hev_mask, &op2, &op1, &op0,
+                   &oq0, &oq1, &oq2);
+    Store8x8x2T_NEON(p3, op2, op1, op0, oq0, oq1, oq2, q3, u, v, stride);
+  }
+}
+
+static void HFilter8i_NEON(uint8_t* WEBP_RESTRICT u, uint8_t* WEBP_RESTRICT v,
+                           int stride, int thresh, int ithresh,
+                           int hev_thresh) {
+  uint8x16_t p3, p2, p1, p0, q0, q1, q2, q3;
+  u += 4;
+  v += 4;
+  Load8x8x2T_NEON(u, v, stride, &p3, &p2, &p1, &p0, &q0, &q1, &q2, &q3);
+  {
+    const uint8x16_t mask =
+        NeedsFilter2_NEON(p3, p2, p1, p0, q0, q1, q2, q3, ithresh, thresh);
+    const uint8x16_t hev_mask = NeedsHev_NEON(p1, p0, q0, q1, hev_thresh);
+    uint8x16_t op1, op0, oq0, oq1;
+    DoFilter4_NEON(p1, p0, q0, q1, mask, hev_mask, &op1, &op0, &oq0, &oq1);
+    Store8x8x2T_NEON(p3, p2, op1, op0, oq0, oq1, q2, q3, u, v, stride);
+  }
+}
+
+#elif !defined(WORK_AROUND_GCC)
 static void HFilter8_NEON(uint8_t* WEBP_RESTRICT u, uint8_t* WEBP_RESTRICT v,
                           int stride, int thresh, int ithresh, int hev_thresh) {
   uint8x16_t p3, p2, p1, p0, q0, q1, q2, q3;
@@ -975,7 +1185,7 @@ static void HFilter8i_NEON(uint8_t* WEBP_RESTRICT u, uint8_t* WEBP_RESTRICT v,
     Store4x8x2_NEON(op1, op0, oq0, oq1, u, v, stride);
   }
 }
-#endif  // !WORK_AROUND_GCC
+#endif  // WEBP_AARCH64 / !WORK_AROUND_GCC
 
 //-----------------------------------------------------------------------------
 // Inverse transforms (Paragraph 14.4)
