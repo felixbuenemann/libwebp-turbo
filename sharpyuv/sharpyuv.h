@@ -51,8 +51,8 @@ extern "C" {
 
 // SharpYUV API version following the convention from semver.org
 #define SHARPYUV_VERSION_MAJOR 0
-#define SHARPYUV_VERSION_MINOR 4
-#define SHARPYUV_VERSION_PATCH 2
+#define SHARPYUV_VERSION_MINOR 5
+#define SHARPYUV_VERSION_PATCH 0
 // Version as a uint32_t. The major number is the high 8 bits.
 // The minor number is the middle 8 bits. The patch number is the low 16 bits.
 #define SHARPYUV_MAKE_VERSION(MAJOR, MINOR, PATCH) \
@@ -154,6 +154,9 @@ struct SharpYuvOptions {
   // SharpYuvComputeConversionMatrix.
   const SharpYuvConversionMatrix* yuv_matrix;
   SharpYuvTransferFunctionType transfer_type;
+  // If true, the conversion may use several threads. The output is the same
+  // whether threading is enabled or not.
+  int use_threads;
 };
 
 // Internal, version-checked, entry point

@@ -81,12 +81,17 @@ static const int kMinDimensionIterativeConversion = 4;
 
 static int PreprocessARGB(const uint8_t* r_ptr, const uint8_t* g_ptr,
                           const uint8_t* b_ptr, int step, int rgb_stride,
-                          WebPPicture* const picture) {
-  const int ok = SharpYuvConvert(
+                          int use_threads, WebPPicture* const picture) {
+  SharpYuvOptions options;
+  int ok;
+  options.yuv_matrix = SharpYuvGetConversionMatrix(kSharpYuvMatrixWebp);
+  options.transfer_type = kSharpYuvTransferFunctionSrgb;
+  options.use_threads = use_threads;
+  ok = SharpYuvConvertWithOptions(
       r_ptr, g_ptr, b_ptr, step, rgb_stride, /*rgb_bit_depth=*/8, picture->y,
       picture->y_stride, picture->u, picture->uv_stride, picture->v,
       picture->uv_stride, /*yuv_bit_depth=*/8, picture->width, picture->height,
-      SharpYuvGetConversionMatrix(kSharpYuvMatrixWebp));
+      &options);
   if (!ok) {
     return WebPEncodingSetError(picture, VP8_ENC_ERROR_OUT_OF_MEMORY);
   }
@@ -124,7 +129,7 @@ static int ImportYUVAFromRGBA(const uint8_t* r_ptr, const uint8_t* g_ptr,
                               int step,        // bytes per pixel
                               int rgb_stride,  // bytes per scanline
                               float dithering, int use_iterative_conversion,
-                              WebPPicture* const picture) {
+                              int use_threads, WebPPicture* const picture) {
   int y;
   const int width = picture->width;
   const int height = picture->height;
@@ -148,7 +153,8 @@ static int ImportYUVAFromRGBA(const uint8_t* r_ptr, const uint8_t* g_ptr,
 
   if (use_iterative_conversion) {
     SharpYuvInit(VP8GetCPUInfo);
-    if (!PreprocessARGB(r_ptr, g_ptr, b_ptr, step, rgb_stride, picture)) {
+    if (!PreprocessARGB(r_ptr, g_ptr, b_ptr, step, rgb_stride, use_threads,
+                        picture)) {
       return 0;
     }
     if (has_alpha) {
@@ -264,7 +270,8 @@ static int ImportYUVAFromRGBA(const uint8_t* r_ptr, const uint8_t* g_ptr,
 // call for ARGB->YUVA conversion
 
 static int PictureARGBToYUVA(WebPPicture* picture, WebPEncCSP colorspace,
-                             float dithering, int use_iterative_conversion) {
+                             float dithering, int use_iterative_conversion,
+                             int use_threads) {
   if (picture == NULL) return 0;
   if (picture->argb == NULL) {
     return WebPEncodingSetError(picture, VP8_ENC_ERROR_NULL_PARAMETER);
@@ -279,21 +286,26 @@ static int PictureARGBToYUVA(WebPPicture* picture, WebPEncCSP colorspace,
 
     picture->colorspace = WEBP_YUV420;
     return ImportYUVAFromRGBA(r, g, b, a, 4, 4 * picture->argb_stride,
-                              dithering, use_iterative_conversion, picture);
+                              dithering, use_iterative_conversion, use_threads,
+                              picture);
   }
 }
 
 int WebPPictureARGBToYUVADithered(WebPPicture* picture, WebPEncCSP colorspace,
                                   float dithering) {
-  return PictureARGBToYUVA(picture, colorspace, dithering, 0);
+  return PictureARGBToYUVA(picture, colorspace, dithering, 0, 0);
 }
 
 int WebPPictureARGBToYUVA(WebPPicture* picture, WebPEncCSP colorspace) {
-  return PictureARGBToYUVA(picture, colorspace, 0.f, 0);
+  return PictureARGBToYUVA(picture, colorspace, 0.f, 0, 0);
+}
+
+int WebPPictureSharpARGBToYUVAThreaded(WebPPicture* picture, int use_threads) {
+  return PictureARGBToYUVA(picture, WEBP_YUV420, 0.f, 1, use_threads);
 }
 
 int WebPPictureSharpARGBToYUVA(WebPPicture* picture) {
-  return PictureARGBToYUVA(picture, WEBP_YUV420, 0.f, 1);
+  return WebPPictureSharpARGBToYUVAThreaded(picture, 0);
 }
 // for backward compatibility
 int WebPPictureSmartARGBToYUVA(WebPPicture* picture) {
@@ -381,7 +393,7 @@ static int Import(WebPPicture* const picture, const uint8_t* rgb,
   if (!picture->use_argb) {
     const uint8_t* a_ptr = import_alpha ? rgb + 3 : NULL;
     return ImportYUVAFromRGBA(r_ptr, g_ptr, b_ptr, a_ptr, step, rgb_stride,
-                              0.f /* no dithering */, 0, picture);
+                              0.f /* no dithering */, 0, 0, picture);
   }
   if (!WebPPictureAlloc(picture)) return 0;
 

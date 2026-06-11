@@ -477,6 +477,11 @@ int WebPEncodingSetError(const WebPPicture* const pic, WebPEncodingError error);
 int WebPReportProgress(const WebPPicture* const pic, int percent,
                        int* const percent_store);
 
+// in picture_csp_enc.c
+// Same as WebPPictureSharpARGBToYUVA() but optionally multi-threaded (the
+// output does not depend on the number of threads).
+int WebPPictureSharpARGBToYUVAThreaded(WebPPicture* picture, int use_threads);
+
 // in analysis.c
 // Main analysis loop. Decides the segmentations and complexity.
 // Assigns a first guess for Intra16 and 'uvmode' prediction modes.
