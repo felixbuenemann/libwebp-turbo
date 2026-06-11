@@ -187,6 +187,196 @@ static void SharpYuvFilterRow_SSE2(const int16_t* A, const int16_t* B, int len,
 }
 
 //------------------------------------------------------------------------------
+// Gamma-space gray computation, going through linear space for averages. The
+// sRGB transfer function and its inverse are evaluated with polynomial
+// approximations whose error is below the quantization error of the
+// table-based scalar versions in sharpyuv_gamma.c.
+
+#include "./sharpyuv_gamma.h"
+
+// thresh = 0.018053968510807, a = 0.09929682680944 (as in sharpyuv_gamma.c).
+#define SHARPYUV_GAMMA_THRESH 0.018053968510807f
+#define SHARPYUV_GAMMA_A 0.09929682680944f
+
+// res = (mask) ? a : b
+static WEBP_INLINE __m128 Select_SSE2(const __m128 mask, const __m128 a,
+                                      const __m128 b) {
+  return _mm_or_ps(_mm_and_ps(mask, a), _mm_andnot_ps(mask, b));
+}
+
+// Degree-6 least-squares fit of ((g + a) / (1 + a)) ^ (1 / 0.45) on
+// [4.5 * thresh, 1]. Max error 4.4e-6, below the 16-bit quantization of the
+// table used by SharpYuvGammaToLinear().
+static WEBP_INLINE __m128 GammaToLinear_SSE2(const __m128 g) {
+  const __m128 lo = _mm_mul_ps(g, _mm_set1_ps(1.0f / 4.5f));
+  __m128 p = _mm_set1_ps(-2.035152666e-02f);
+  p = _mm_add_ps(_mm_mul_ps(p, g), _mm_set1_ps(9.086542551e-02f));
+  p = _mm_add_ps(_mm_mul_ps(p, g), _mm_set1_ps(-1.905903016e-01f));
+  p = _mm_add_ps(_mm_mul_ps(p, g), _mm_set1_ps(3.256689955e-01f));
+  p = _mm_add_ps(_mm_mul_ps(p, g), _mm_set1_ps(6.849562000e-01f));
+  p = _mm_add_ps(_mm_mul_ps(p, g), _mm_set1_ps(1.045739367e-01f));
+  p = _mm_add_ps(_mm_mul_ps(p, g), _mm_set1_ps(4.874765193e-03f));
+  return Select_SSE2(
+      _mm_cmple_ps(g, _mm_set1_ps(SHARPYUV_GAMMA_THRESH * 4.5f)), lo, p);
+}
+
+// (1 + a) * l ^ 0.45 - a, with l ^ 0.45 evaluated as a degree-7 fit in
+// u = sqrt(sqrt(l)) on [thresh, 1]. Max error 1e-7, about 500x below the
+// quantization of the 512-entry interpolated table used by
+// SharpYuvLinearToGamma().
+static WEBP_INLINE __m128 LinearToGamma_SSE2(const __m128 l) {
+  const __m128 lo = _mm_mul_ps(l, _mm_set1_ps(4.5f));
+  const __m128 u = _mm_sqrt_ps(_mm_sqrt_ps(l));
+  __m128 p = _mm_set1_ps(-1.622143889e-02f);
+  p = _mm_add_ps(_mm_mul_ps(p, u), _mm_set1_ps(9.720616133e-02f));
+  p = _mm_add_ps(_mm_mul_ps(p, u), _mm_set1_ps(-2.609642418e-01f));
+  p = _mm_add_ps(_mm_mul_ps(p, u), _mm_set1_ps(4.250514527e-01f));
+  p = _mm_add_ps(_mm_mul_ps(p, u), _mm_set1_ps(-5.155822037e-01f));
+  p = _mm_add_ps(_mm_mul_ps(p, u), _mm_set1_ps(1.208584132e+00f));
+  p = _mm_add_ps(_mm_mul_ps(p, u), _mm_set1_ps(6.450501113e-02f));
+  p = _mm_add_ps(_mm_mul_ps(p, u), _mm_set1_ps(-2.578887858e-03f));
+  p = _mm_sub_ps(_mm_mul_ps(p, _mm_set1_ps(1.0f + SHARPYUV_GAMMA_A)),
+                 _mm_set1_ps(SHARPYUV_GAMMA_A));
+  return Select_SSE2(_mm_cmple_ps(l, _mm_set1_ps(SHARPYUV_GAMMA_THRESH)), lo,
+                     p);
+}
+
+// Loads 4 16-bit samples and normalizes them to [0, 1].
+static WEBP_INLINE __m128 LoadNormalized_SSE2(const uint16_t* src,
+                                              const __m128 norm) {
+  const __m128i zero = _mm_setzero_si128();
+  const __m128i s = _mm_loadl_epi64((const __m128i*)src);
+  return _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(s, zero)), norm);
+}
+
+static int RGBToGray_SSE2(int64_t r, int64_t g, int64_t b) {
+  const int64_t luma = 13933 * r + 46871 * g + 4732 * b + (1 << 15);
+  return (int)(luma >> 16);
+}
+
+static void SharpYuvUpdateW_SSE2(const uint16_t* src, uint16_t* dst, int w,
+                                 int bit_depth,
+                                 SharpYuvTransferFunctionType transfer_type) {
+  int i = 0;
+  if (transfer_type != kSharpYuvTransferFunctionSrgb) {
+    SharpYuvUpdateW_C(src, dst, w, bit_depth, transfer_type);
+    return;
+  }
+  {
+    const __m128 norm = _mm_set1_ps(1.0f / (1 << bit_depth));
+    const __m128 scale = _mm_set1_ps((float)(1 << bit_depth));
+    // RGBToGray() coefficients, normalized back from their 16 bit fixed-point.
+    const __m128 coeff_r = _mm_set1_ps(13933.0f / 65536.0f);
+    const __m128 coeff_g = _mm_set1_ps(46871.0f / 65536.0f);
+    const __m128 coeff_b = _mm_set1_ps(4732.0f / 65536.0f);
+    for (; i + 4 <= w; i += 4) {
+      const __m128 r =
+          GammaToLinear_SSE2(LoadNormalized_SSE2(src + 0 * w + i, norm));
+      const __m128 g =
+          GammaToLinear_SSE2(LoadNormalized_SSE2(src + 1 * w + i, norm));
+      const __m128 b =
+          GammaToLinear_SSE2(LoadNormalized_SSE2(src + 2 * w + i, norm));
+      const __m128 gray =
+          _mm_add_ps(_mm_add_ps(_mm_mul_ps(r, coeff_r), _mm_mul_ps(g, coeff_g)),
+                     _mm_mul_ps(b, coeff_b));
+      const __m128 y = _mm_mul_ps(LinearToGamma_SSE2(gray), scale);
+      const __m128i out = _mm_cvtps_epi32(y);  // values fit in 14 bits
+      _mm_storel_epi64((__m128i*)(dst + i), _mm_packs_epi32(out, out));
+    }
+  }
+  for (; i < w; ++i) {  // left-over
+    const uint32_t R =
+        SharpYuvGammaToLinear(src[0 * w + i], bit_depth, transfer_type);
+    const uint32_t G =
+        SharpYuvGammaToLinear(src[1 * w + i], bit_depth, transfer_type);
+    const uint32_t B =
+        SharpYuvGammaToLinear(src[2 * w + i], bit_depth, transfer_type);
+    const uint32_t Y = RGBToGray_SSE2(R, G, B);
+    dst[i] = (uint16_t)SharpYuvLinearToGamma(Y, bit_depth, transfer_type);
+  }
+}
+
+// Loads 8 gamma-space samples, converts them to linear space and adds them
+// pairwise.
+static WEBP_INLINE __m128 LoadLinearPairs_SSE2(const uint16_t* src,
+                                               const __m128 norm) {
+  const __m128i zero = _mm_setzero_si128();
+  const __m128i s = _mm_loadu_si128((const __m128i*)src);
+  const __m128 lo = GammaToLinear_SSE2(
+      _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(s, zero)), norm));
+  const __m128 hi = GammaToLinear_SSE2(
+      _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(s, zero)), norm));
+  const __m128 evens = _mm_shuffle_ps(lo, hi, _MM_SHUFFLE(2, 0, 2, 0));
+  const __m128 odds = _mm_shuffle_ps(lo, hi, _MM_SHUFFLE(3, 1, 3, 1));
+  return _mm_add_ps(evens, odds);
+}
+
+static void SharpYuvUpdateChroma_SSE2(
+    const uint16_t* src1, const uint16_t* src2, int16_t* dst, int uv_w,
+    int bit_depth, SharpYuvTransferFunctionType transfer_type) {
+  int i = 0;
+  if (transfer_type != kSharpYuvTransferFunctionSrgb) {
+    SharpYuvUpdateChroma_C(src1, src2, dst, uv_w, bit_depth, transfer_type);
+    return;
+  }
+  {
+    const __m128 norm = _mm_set1_ps(1.0f / (1 << bit_depth));
+    const __m128 scale = _mm_set1_ps((float)(1 << bit_depth));
+    // RGBToGray() coefficients, normalized back from their 16 bit fixed-point.
+    const __m128 coeff_r = _mm_set1_ps(13933.0f / 65536.0f);
+    const __m128 coeff_g = _mm_set1_ps(46871.0f / 65536.0f);
+    const __m128 coeff_b = _mm_set1_ps(4732.0f / 65536.0f);
+    for (; i + 4 <= uv_w; i += 4) {
+      __m128 v[3];
+      __m128i vi[3], gray;
+      int p;
+      for (p = 0; p < 3; ++p) {
+        // Average 2x2 blocks of gamma-space samples in linear space.
+        const __m128 sum =
+            _mm_add_ps(LoadLinearPairs_SSE2(src1 + 2 * p * uv_w + 2 * i, norm),
+                       LoadLinearPairs_SSE2(src2 + 2 * p * uv_w + 2 * i, norm));
+        const __m128 avg = _mm_mul_ps(sum, _mm_set1_ps(0.25f));
+        vi[p] = _mm_cvtps_epi32(_mm_mul_ps(LinearToGamma_SSE2(avg), scale));
+        v[p] = _mm_cvtepi32_ps(vi[p]);
+      }
+      // Like RGBToGray(), computed in float as SSE2 has no 32-bit integer
+      // multiplication (the rounding very rarely differs by one).
+      gray = _mm_cvtps_epi32(_mm_add_ps(
+          _mm_add_ps(_mm_mul_ps(v[0], coeff_r), _mm_mul_ps(v[1], coeff_g)),
+          _mm_mul_ps(v[2], coeff_b)));
+      for (p = 0; p < 3; ++p) {
+        const __m128i diff = _mm_sub_epi32(vi[p], gray);
+        _mm_storel_epi64((__m128i*)(dst + p * uv_w + i),
+                         _mm_packs_epi32(diff, diff));
+      }
+    }
+  }
+  for (; i < uv_w; ++i) {  // left-over
+    int v[3], W, p;
+    for (p = 0; p < 3; ++p) {
+      const int off = 2 * p * uv_w + 2 * i;
+      const uint32_t A =
+          SharpYuvGammaToLinear(src1[off + 0], bit_depth, transfer_type);
+      const uint32_t B =
+          SharpYuvGammaToLinear(src1[off + 1], bit_depth, transfer_type);
+      const uint32_t C =
+          SharpYuvGammaToLinear(src2[off + 0], bit_depth, transfer_type);
+      const uint32_t D =
+          SharpYuvGammaToLinear(src2[off + 1], bit_depth, transfer_type);
+      v[p] = SharpYuvLinearToGamma((A + B + C + D + 2) >> 2, bit_depth,
+                                   transfer_type);
+    }
+    W = RGBToGray_SSE2(v[0], v[1], v[2]);
+    for (p = 0; p < 3; ++p) {
+      dst[p * uv_w + i] = (int16_t)(v[p] - W);
+    }
+  }
+}
+
+#undef SHARPYUV_GAMMA_THRESH
+#undef SHARPYUV_GAMMA_A
+
+//------------------------------------------------------------------------------
 
 extern void InitSharpYuvSSE2(void);
 
@@ -194,6 +384,8 @@ WEBP_TSAN_IGNORE_FUNCTION void InitSharpYuvSSE2(void) {
   SharpYuvUpdateY = SharpYuvUpdateY_SSE2;
   SharpYuvUpdateRGB = SharpYuvUpdateRGB_SSE2;
   SharpYuvFilterRow = SharpYuvFilterRow_SSE2;
+  SharpYuvUpdateW = SharpYuvUpdateW_SSE2;
+  SharpYuvUpdateChroma = SharpYuvUpdateChroma_SSE2;
 }
 #else  // !WEBP_USE_SSE2
 

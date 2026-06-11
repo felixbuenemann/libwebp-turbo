@@ -72,57 +72,6 @@ static int RGBToGray(int64_t r, int64_t g, int64_t b) {
   return (int)(luma >> YUV_FIX);
 }
 
-static uint32_t ScaleDown(uint16_t a, uint16_t b, uint16_t c, uint16_t d,
-                          int bit_depth,
-                          SharpYuvTransferFunctionType transfer_type) {
-  const uint32_t A = SharpYuvGammaToLinear(a, bit_depth, transfer_type);
-  const uint32_t B = SharpYuvGammaToLinear(b, bit_depth, transfer_type);
-  const uint32_t C = SharpYuvGammaToLinear(c, bit_depth, transfer_type);
-  const uint32_t D = SharpYuvGammaToLinear(d, bit_depth, transfer_type);
-  return SharpYuvLinearToGamma((A + B + C + D + 2) >> 2, bit_depth,
-                               transfer_type);
-}
-
-static WEBP_INLINE void UpdateW(const fixed_y_t* src, fixed_y_t* dst, int w,
-                                int bit_depth,
-                                SharpYuvTransferFunctionType transfer_type) {
-  int i = 0;
-  do {
-    const uint32_t R =
-        SharpYuvGammaToLinear(src[0 * w + i], bit_depth, transfer_type);
-    const uint32_t G =
-        SharpYuvGammaToLinear(src[1 * w + i], bit_depth, transfer_type);
-    const uint32_t B =
-        SharpYuvGammaToLinear(src[2 * w + i], bit_depth, transfer_type);
-    const uint32_t Y = RGBToGray(R, G, B);
-    dst[i] = (fixed_y_t)SharpYuvLinearToGamma(Y, bit_depth, transfer_type);
-  } while (++i < w);
-}
-
-static void UpdateChroma(const fixed_y_t* src1, const fixed_y_t* src2,
-                         fixed_t* dst, int uv_w, int bit_depth,
-                         SharpYuvTransferFunctionType transfer_type) {
-  int i = 0;
-  do {
-    const int r =
-        ScaleDown(src1[0 * uv_w + 0], src1[0 * uv_w + 1], src2[0 * uv_w + 0],
-                  src2[0 * uv_w + 1], bit_depth, transfer_type);
-    const int g =
-        ScaleDown(src1[2 * uv_w + 0], src1[2 * uv_w + 1], src2[2 * uv_w + 0],
-                  src2[2 * uv_w + 1], bit_depth, transfer_type);
-    const int b =
-        ScaleDown(src1[4 * uv_w + 0], src1[4 * uv_w + 1], src2[4 * uv_w + 0],
-                  src2[4 * uv_w + 1], bit_depth, transfer_type);
-    const int W = RGBToGray(r, g, b);
-    dst[0 * uv_w] = (fixed_t)(r - W);
-    dst[1 * uv_w] = (fixed_t)(g - W);
-    dst[2 * uv_w] = (fixed_t)(b - W);
-    dst += 1;
-    src1 += 2;
-    src2 += 2;
-  } while (++i < uv_w);
-}
-
 static void StoreGray(const fixed_y_t* rgb, fixed_y_t* y, int w) {
   int i = 0;
   assert(w > 0);
@@ -376,9 +325,10 @@ static int DoSharpArgbToYuv(const uint8_t* r_ptr, const uint8_t* g_ptr,
     StoreGray(src1, best_y + 0, w);
     StoreGray(src2, best_y + w, w);
 
-    UpdateW(src1, target_y, w, y_bit_depth, transfer_type);
-    UpdateW(src2, target_y + w, w, y_bit_depth, transfer_type);
-    UpdateChroma(src1, src2, target_uv, uv_w, y_bit_depth, transfer_type);
+    SharpYuvUpdateW(src1, target_y, w, y_bit_depth, transfer_type);
+    SharpYuvUpdateW(src2, target_y + w, w, y_bit_depth, transfer_type);
+    SharpYuvUpdateChroma(src1, src2, target_uv, uv_w, y_bit_depth,
+                         transfer_type);
     memcpy(best_uv, target_uv, 3 * uv_w * sizeof(*best_uv));
     best_y += 2 * w;
     best_uv += 3 * uv_w;
@@ -411,9 +361,12 @@ static int DoSharpArgbToYuv(const uint8_t* r_ptr, const uint8_t* g_ptr,
         cur_uv = next_uv;
       }
 
-      UpdateW(src1, best_rgb_y + 0 * w, w, y_bit_depth, transfer_type);
-      UpdateW(src2, best_rgb_y + 1 * w, w, y_bit_depth, transfer_type);
-      UpdateChroma(src1, src2, best_rgb_uv, uv_w, y_bit_depth, transfer_type);
+      SharpYuvUpdateW(src1, best_rgb_y + 0 * w, w, y_bit_depth,
+                      transfer_type);
+      SharpYuvUpdateW(src2, best_rgb_y + 1 * w, w, y_bit_depth,
+                      transfer_type);
+      SharpYuvUpdateChroma(src1, src2, best_rgb_uv, uv_w, y_bit_depth,
+                           transfer_type);
 
       // update two rows of Y and one row of RGB
       diff_y_sum +=

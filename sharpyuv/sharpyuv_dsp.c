@@ -16,7 +16,9 @@
 #include <assert.h>
 #include <stdlib.h>
 
+#include "./sharpyuv.h"
 #include "./sharpyuv_cpu.h"
+#include "./sharpyuv_gamma.h"
 #include "src/dsp/cpu.h"
 #include "webp/types.h"
 
@@ -65,6 +67,68 @@ static void SharpYuvFilterRow_C(const int16_t* A, const int16_t* B, int len,
 #endif  // !WEBP_NEON_OMIT_C_CODE
 
 //-----------------------------------------------------------------------------
+// Gray (in gamma space) computation, going through linear space for averages.
+
+#define SHARPYUV_YUV_FIX 16  // fixed-point precision for RGB->YUV
+static const int kSharpYuvYuvHalf = 1 << (SHARPYUV_YUV_FIX - 1);
+
+static int RGBToGray_C(int64_t r, int64_t g, int64_t b) {
+  const int64_t luma = 13933 * r + 46871 * g + 4732 * b + kSharpYuvYuvHalf;
+  return (int)(luma >> SHARPYUV_YUV_FIX);
+}
+
+static uint32_t ScaleDown_C(uint16_t a, uint16_t b, uint16_t c, uint16_t d,
+                            int bit_depth,
+                            SharpYuvTransferFunctionType transfer_type) {
+  const uint32_t A = SharpYuvGammaToLinear(a, bit_depth, transfer_type);
+  const uint32_t B = SharpYuvGammaToLinear(b, bit_depth, transfer_type);
+  const uint32_t C = SharpYuvGammaToLinear(c, bit_depth, transfer_type);
+  const uint32_t D = SharpYuvGammaToLinear(d, bit_depth, transfer_type);
+  return SharpYuvLinearToGamma((A + B + C + D + 2) >> 2, bit_depth,
+                               transfer_type);
+}
+
+void SharpYuvUpdateW_C(const uint16_t* src, uint16_t* dst, int w,
+                       int bit_depth,
+                       SharpYuvTransferFunctionType transfer_type) {
+  int i = 0;
+  do {
+    const uint32_t R =
+        SharpYuvGammaToLinear(src[0 * w + i], bit_depth, transfer_type);
+    const uint32_t G =
+        SharpYuvGammaToLinear(src[1 * w + i], bit_depth, transfer_type);
+    const uint32_t B =
+        SharpYuvGammaToLinear(src[2 * w + i], bit_depth, transfer_type);
+    const uint32_t Y = RGBToGray_C(R, G, B);
+    dst[i] = (uint16_t)SharpYuvLinearToGamma(Y, bit_depth, transfer_type);
+  } while (++i < w);
+}
+
+void SharpYuvUpdateChroma_C(const uint16_t* src1, const uint16_t* src2,
+                            int16_t* dst, int uv_w, int bit_depth,
+                            SharpYuvTransferFunctionType transfer_type) {
+  int i = 0;
+  do {
+    const int r =
+        ScaleDown_C(src1[0 * uv_w + 0], src1[0 * uv_w + 1], src2[0 * uv_w + 0],
+                    src2[0 * uv_w + 1], bit_depth, transfer_type);
+    const int g =
+        ScaleDown_C(src1[2 * uv_w + 0], src1[2 * uv_w + 1], src2[2 * uv_w + 0],
+                    src2[2 * uv_w + 1], bit_depth, transfer_type);
+    const int b =
+        ScaleDown_C(src1[4 * uv_w + 0], src1[4 * uv_w + 1], src2[4 * uv_w + 0],
+                    src2[4 * uv_w + 1], bit_depth, transfer_type);
+    const int W = RGBToGray_C(r, g, b);
+    dst[0 * uv_w] = (int16_t)(r - W);
+    dst[1 * uv_w] = (int16_t)(g - W);
+    dst[2 * uv_w] = (int16_t)(b - W);
+    dst += 1;
+    src1 += 2;
+    src2 += 2;
+  } while (++i < uv_w);
+}
+
+//-----------------------------------------------------------------------------
 
 uint64_t (*SharpYuvUpdateY)(const uint16_t* src, const uint16_t* ref,
                             uint16_t* dst, int len, int bit_depth);
@@ -72,6 +136,12 @@ void (*SharpYuvUpdateRGB)(const int16_t* src, const int16_t* ref, int16_t* dst,
                           int len);
 void (*SharpYuvFilterRow)(const int16_t* A, const int16_t* B, int len,
                           const uint16_t* best_y, uint16_t* out, int bit_depth);
+void (*SharpYuvUpdateW)(const uint16_t* src, uint16_t* dst, int w,
+                        int bit_depth,
+                        SharpYuvTransferFunctionType transfer_type);
+void (*SharpYuvUpdateChroma)(const uint16_t* src1, const uint16_t* src2,
+                             int16_t* dst, int uv_w, int bit_depth,
+                             SharpYuvTransferFunctionType transfer_type);
 
 extern VP8CPUInfo SharpYuvGetCPUInfo;
 extern void InitSharpYuvSSE2(void);
@@ -83,6 +153,8 @@ void SharpYuvInitDsp(void) {
   SharpYuvUpdateRGB = SharpYuvUpdateRGB_C;
   SharpYuvFilterRow = SharpYuvFilterRow_C;
 #endif
+  SharpYuvUpdateW = SharpYuvUpdateW_C;
+  SharpYuvUpdateChroma = SharpYuvUpdateChroma_C;
 
   if (SharpYuvGetCPUInfo != NULL) {
 #if defined(WEBP_HAVE_SSE2)
@@ -102,4 +174,6 @@ void SharpYuvInitDsp(void) {
   assert(SharpYuvUpdateY != NULL);
   assert(SharpYuvUpdateRGB != NULL);
   assert(SharpYuvFilterRow != NULL);
+  assert(SharpYuvUpdateW != NULL);
+  assert(SharpYuvUpdateChroma != NULL);
 }

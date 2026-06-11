@@ -163,6 +163,180 @@ static void SharpYuvFilterRow_NEON(const int16_t* A, const int16_t* B, int len,
 }
 
 //------------------------------------------------------------------------------
+// Gamma-space gray computation, going through linear space for averages. The
+// sRGB transfer function and its inverse are evaluated with polynomial
+// approximations whose error is below the quantization error of the
+// table-based scalar versions in sharpyuv_gamma.c. Requires AArch64 for
+// vsqrtq_f32/vcvtnq_u32_f32/vpaddq_f32.
+
+#if WEBP_AARCH64
+
+#include "sharpyuv/sharpyuv_gamma.h"
+
+// thresh = 0.018053968510807, a = 0.09929682680944 (as in sharpyuv_gamma.c).
+#define SHARPYUV_GAMMA_THRESH 0.018053968510807f
+#define SHARPYUV_GAMMA_A 0.09929682680944f
+
+// Degree-6 least-squares fit of ((g + a) / (1 + a)) ^ (1 / 0.45) on
+// [4.5 * thresh, 1]. Max error 4.4e-6, below the 16-bit quantization of the
+// table used by SharpYuvGammaToLinear().
+static WEBP_INLINE float32x4_t GammaToLinear_NEON(const float32x4_t g) {
+  const float32x4_t lo = vmulq_n_f32(g, 1.0f / 4.5f);
+  float32x4_t p = vdupq_n_f32(-2.035152666e-02f);
+  p = vfmaq_f32(vdupq_n_f32(9.086542551e-02f), p, g);
+  p = vfmaq_f32(vdupq_n_f32(-1.905903016e-01f), p, g);
+  p = vfmaq_f32(vdupq_n_f32(3.256689955e-01f), p, g);
+  p = vfmaq_f32(vdupq_n_f32(6.849562000e-01f), p, g);
+  p = vfmaq_f32(vdupq_n_f32(1.045739367e-01f), p, g);
+  p = vfmaq_f32(vdupq_n_f32(4.874765193e-03f), p, g);
+  return vbslq_f32(vcleq_f32(g, vdupq_n_f32(SHARPYUV_GAMMA_THRESH * 4.5f)), lo,
+                   p);
+}
+
+// (1 + a) * l ^ 0.45 - a, with l ^ 0.45 evaluated as a degree-7 fit in
+// u = sqrt(sqrt(l)) on [thresh, 1]. Max error 1e-7, about 500x below the
+// quantization of the 512-entry interpolated table used by
+// SharpYuvLinearToGamma().
+static WEBP_INLINE float32x4_t LinearToGamma_NEON(const float32x4_t l) {
+  const float32x4_t lo = vmulq_n_f32(l, 4.5f);
+  const float32x4_t u = vsqrtq_f32(vsqrtq_f32(l));
+  float32x4_t p = vdupq_n_f32(-1.622143889e-02f);
+  p = vfmaq_f32(vdupq_n_f32(9.720616133e-02f), p, u);
+  p = vfmaq_f32(vdupq_n_f32(-2.609642418e-01f), p, u);
+  p = vfmaq_f32(vdupq_n_f32(4.250514527e-01f), p, u);
+  p = vfmaq_f32(vdupq_n_f32(-5.155822037e-01f), p, u);
+  p = vfmaq_f32(vdupq_n_f32(1.208584132e+00f), p, u);
+  p = vfmaq_f32(vdupq_n_f32(6.450501113e-02f), p, u);
+  p = vfmaq_f32(vdupq_n_f32(-2.578887858e-03f), p, u);
+  p = vfmaq_f32(vdupq_n_f32(-SHARPYUV_GAMMA_A), p,
+                vdupq_n_f32(1.0f + SHARPYUV_GAMMA_A));
+  return vbslq_f32(vcleq_f32(l, vdupq_n_f32(SHARPYUV_GAMMA_THRESH)), lo, p);
+}
+
+static WEBP_INLINE float32x4_t LoadNormalized_NEON(const uint16_t* src,
+                                                   const float32x4_t norm) {
+  return vmulq_f32(vcvtq_f32_u32(vmovl_u16(vld1_u16(src))), norm);
+}
+
+static int RGBToGray_NEON(int64_t r, int64_t g, int64_t b) {
+  const int64_t luma = 13933 * r + 46871 * g + 4732 * b + (1 << 15);
+  return (int)(luma >> 16);
+}
+
+static void SharpYuvUpdateW_NEON(const uint16_t* src, uint16_t* dst, int w,
+                                 int bit_depth,
+                                 SharpYuvTransferFunctionType transfer_type) {
+  int i = 0;
+  if (transfer_type != kSharpYuvTransferFunctionSrgb) {
+    SharpYuvUpdateW_C(src, dst, w, bit_depth, transfer_type);
+    return;
+  }
+  {
+    const float32x4_t norm = vdupq_n_f32(1.0f / (1 << bit_depth));
+    const float32x4_t scale = vdupq_n_f32((float)(1 << bit_depth));
+    // RGBToGray() coefficients, normalized back from their 16 bit fixed-point.
+    const float32x4_t coeff_g = vdupq_n_f32(46871.0f / 65536.0f);
+    const float32x4_t coeff_b = vdupq_n_f32(4732.0f / 65536.0f);
+    for (; i + 4 <= w; i += 4) {
+      const float32x4_t r =
+          GammaToLinear_NEON(LoadNormalized_NEON(src + 0 * w + i, norm));
+      const float32x4_t g =
+          GammaToLinear_NEON(LoadNormalized_NEON(src + 1 * w + i, norm));
+      const float32x4_t b =
+          GammaToLinear_NEON(LoadNormalized_NEON(src + 2 * w + i, norm));
+      const float32x4_t gray = vfmaq_f32(
+          vfmaq_f32(vmulq_n_f32(r, 13933.0f / 65536.0f), g, coeff_g), b,
+          coeff_b);
+      const float32x4_t y = vmulq_f32(LinearToGamma_NEON(gray), scale);
+      vst1_u16(dst + i, vmovn_u32(vcvtnq_u32_f32(y)));
+    }
+  }
+  for (; i < w; ++i) {  // left-over
+    const uint32_t R =
+        SharpYuvGammaToLinear(src[0 * w + i], bit_depth, transfer_type);
+    const uint32_t G =
+        SharpYuvGammaToLinear(src[1 * w + i], bit_depth, transfer_type);
+    const uint32_t B =
+        SharpYuvGammaToLinear(src[2 * w + i], bit_depth, transfer_type);
+    const uint32_t Y = RGBToGray_NEON(R, G, B);
+    dst[i] = (uint16_t)SharpYuvLinearToGamma(Y, bit_depth, transfer_type);
+  }
+}
+
+// Loads 8 gamma-space samples, converts them to linear space and adds them
+// pairwise.
+static WEBP_INLINE float32x4_t LoadLinearPairs_NEON(const uint16_t* src,
+                                                    const float32x4_t norm) {
+  const uint16x8_t s = vld1q_u16(src);
+  const float32x4_t lo = GammaToLinear_NEON(
+      vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(s))), norm));
+  const float32x4_t hi = GammaToLinear_NEON(
+      vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(s))), norm));
+  return vpaddq_f32(lo, hi);
+}
+
+static void SharpYuvUpdateChroma_NEON(
+    const uint16_t* src1, const uint16_t* src2, int16_t* dst, int uv_w,
+    int bit_depth, SharpYuvTransferFunctionType transfer_type) {
+  int i = 0;
+  if (transfer_type != kSharpYuvTransferFunctionSrgb) {
+    SharpYuvUpdateChroma_C(src1, src2, dst, uv_w, bit_depth, transfer_type);
+    return;
+  }
+  {
+    const float32x4_t norm = vdupq_n_f32(1.0f / (1 << bit_depth));
+    const float32x4_t scale = vdupq_n_f32((float)(1 << bit_depth));
+    for (; i + 4 <= uv_w; i += 4) {
+      int32x4_t v[3];
+      int32x4_t gray;
+      int p;
+      for (p = 0; p < 3; ++p) {
+        // Average 2x2 blocks of gamma-space samples in linear space.
+        const float32x4_t sum =
+            vaddq_f32(LoadLinearPairs_NEON(src1 + 2 * p * uv_w + 2 * i, norm),
+                      LoadLinearPairs_NEON(src2 + 2 * p * uv_w + 2 * i, norm));
+        const float32x4_t avg = vmulq_n_f32(sum, 0.25f);
+        v[p] = vcvtnq_s32_f32(vmulq_f32(LinearToGamma_NEON(avg), scale));
+      }
+      // Same as RGBToGray(): exact, as the products fit in int32 (the samples
+      // have at most 14 bits).
+      gray = vmulq_s32(v[0], vdupq_n_s32(13933));
+      gray = vmlaq_s32(gray, v[1], vdupq_n_s32(46871));
+      gray = vmlaq_s32(gray, v[2], vdupq_n_s32(4732));
+      gray = vshrq_n_s32(vaddq_s32(gray, vdupq_n_s32(1 << 15)), 16);
+      for (p = 0; p < 3; ++p) {
+        vst1_s16(dst + p * uv_w + i, vmovn_s32(vsubq_s32(v[p], gray)));
+      }
+    }
+  }
+  for (; i < uv_w; ++i) {  // left-over
+    int v[3], W, p;
+    for (p = 0; p < 3; ++p) {
+      const int off = 2 * p * uv_w + 2 * i;
+      const uint32_t A =
+          SharpYuvGammaToLinear(src1[off + 0], bit_depth, transfer_type);
+      const uint32_t B =
+          SharpYuvGammaToLinear(src1[off + 1], bit_depth, transfer_type);
+      const uint32_t C =
+          SharpYuvGammaToLinear(src2[off + 0], bit_depth, transfer_type);
+      const uint32_t D =
+          SharpYuvGammaToLinear(src2[off + 1], bit_depth, transfer_type);
+      v[p] = SharpYuvLinearToGamma((A + B + C + D + 2) >> 2, bit_depth,
+                                   transfer_type);
+    }
+    W = RGBToGray_NEON(v[0], v[1], v[2]);
+    for (p = 0; p < 3; ++p) {
+      dst[p * uv_w + i] = (int16_t)(v[p] - W);
+    }
+  }
+}
+
+#undef SHARPYUV_GAMMA_THRESH
+#undef SHARPYUV_GAMMA_A
+
+#endif  // WEBP_AARCH64
+
+//------------------------------------------------------------------------------
 
 extern void InitSharpYuvNEON(void);
 
@@ -170,6 +344,10 @@ WEBP_TSAN_IGNORE_FUNCTION void InitSharpYuvNEON(void) {
   SharpYuvUpdateY = SharpYuvUpdateY_NEON;
   SharpYuvUpdateRGB = SharpYuvUpdateRGB_NEON;
   SharpYuvFilterRow = SharpYuvFilterRow_NEON;
+#if WEBP_AARCH64
+  SharpYuvUpdateW = SharpYuvUpdateW_NEON;
+  SharpYuvUpdateChroma = SharpYuvUpdateChroma_NEON;
+#endif
 }
 
 #else  // !WEBP_USE_NEON
