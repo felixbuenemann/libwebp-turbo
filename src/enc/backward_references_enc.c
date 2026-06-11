@@ -21,6 +21,9 @@
 #include "src/enc/histogram_enc.h"
 #include "src/enc/vp8i_enc.h"
 #include "src/utils/color_cache_utils.h"
+#if defined(WEBP_EXPERIMENTAL_MT_HASH_CHAIN)
+#include "src/utils/thread_utils.h"
+#endif
 #include "src/utils/utils.h"
 #include "src/webp/encode.h"
 #include "src/webp/format_constants.h"
@@ -252,10 +255,223 @@ static WEBP_INLINE int MaxFindCopyLength(int len) {
   return (len < MAX_LENGTH) ? len : MAX_LENGTH;
 }
 
+// Finds the best match interval (an offset to the pixel and a length) at each
+// position in [lo, from] (scanned in decreasing order), reading the hash
+// chain links from 'chain' and storing the result in p->offset_length.
+// Positions lower than 'lo' are not written to.
+// 'pic' can be NULL, in which case no progress is reported and the function
+// cannot fail. Returns 0 on user abort.
+static int HashChainFillSearch(VP8LHashChain* const p,
+                               const int32_t* const chain,
+                               const uint32_t* const argb, int size, int xsize,
+                               int iter_max, uint32_t window_size,
+                               int low_effort, int lo, int from,
+                               const WebPPicture* const pic, int percent_range,
+                               int percent_start, int* const percent) {
+  uint32_t base_position;
+  for (base_position = from; base_position >= (uint32_t)lo;) {
+    const int max_len = MaxFindCopyLength(size - 1 - base_position);
+    const uint32_t* const argb_start = argb + base_position;
+    int iter = iter_max;
+    int best_length = 0;
+    uint32_t best_distance = 0;
+    uint32_t best_argb;
+    const int min_pos =
+        (base_position > window_size) ? base_position - window_size : 0;
+    const int length_max = (max_len < 256) ? max_len : 256;
+    uint32_t max_base_position;
+    int pos;
+
+    pos = chain[base_position];
+    if (!low_effort) {
+      int curr_length;
+      // Heuristic: use the comparison with the above line as an initialization.
+      if (base_position >= (uint32_t)xsize) {
+        curr_length = FindMatchLength(argb_start - xsize, argb_start,
+                                      best_length, max_len);
+        if (curr_length > best_length) {
+          best_length = curr_length;
+          best_distance = xsize;
+        }
+        --iter;
+      }
+      // Heuristic: compare to the previous pixel.
+      curr_length =
+          FindMatchLength(argb_start - 1, argb_start, best_length, max_len);
+      if (curr_length > best_length) {
+        best_length = curr_length;
+        best_distance = 1;
+      }
+      --iter;
+      // Skip the for loop if we already have the maximum.
+      if (best_length == MAX_LENGTH) pos = min_pos - 1;
+    }
+    best_argb = argb_start[best_length];
+
+    for (; pos >= min_pos && --iter; pos = chain[pos]) {
+      int curr_length;
+      assert(base_position > (uint32_t)pos);
+
+      if (argb[pos + best_length] != best_argb) continue;
+
+      curr_length = VP8LVectorMismatch(argb + pos, argb_start, max_len);
+      if (best_length < curr_length) {
+        best_length = curr_length;
+        best_distance = base_position - pos;
+        best_argb = argb_start[best_length];
+        // Stop if we have reached a good enough length.
+        if (best_length >= length_max) break;
+      }
+    }
+    // We have the best match but in case the two intervals continue matching
+    // to the left, we have the best matches for the left-extended pixels.
+    max_base_position = base_position;
+    while (1) {
+      assert(best_length <= MAX_LENGTH);
+      assert(best_distance <= WINDOW_SIZE);
+      p->offset_length[base_position] =
+          (best_distance << MAX_LENGTH_BITS) | (uint32_t)best_length;
+      --base_position;
+      // Stop if we don't have a match or if we are out of bounds.
+      if (best_distance == 0 || base_position < (uint32_t)lo) break;
+      // Stop if we cannot extend the matching intervals to the left.
+      if (base_position < best_distance ||
+          argb[base_position - best_distance] != argb[base_position]) {
+        break;
+      }
+      // Stop if we are matching at its limit because there could be a closer
+      // matching interval with the same maximum length. Then again, if the
+      // matching interval is as close as possible (best_distance == 1), we will
+      // never find anything better so let's continue.
+      if (best_length == MAX_LENGTH && best_distance != 1 &&
+          base_position + MAX_LENGTH < max_base_position) {
+        break;
+      }
+      if (best_length < MAX_LENGTH) {
+        ++best_length;
+        max_base_position = base_position;
+      }
+    }
+
+    if (pic != NULL &&
+        !WebPReportProgress(pic,
+                            percent_start + percent_range *
+                                                (size - 2 - base_position) /
+                                                (size - 2),
+                            percent)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+#if defined(WEBP_EXPERIMENTAL_MT_HASH_CHAIN)
+
+// The match search is processed in chunks of this many positions, handed out
+// to the workers. The chunking (and therefore the output) is the same
+// whatever the number of threads actually available; positions at the high
+// end of a chunk can however get a different (but equally valid) match
+// interval than in the single-threaded version, as matches do not get
+// extended to the left across chunk boundaries.
+#define MT_HASH_CHAIN_CHUNK_SIZE (1 << 18)
+#define MT_HASH_CHAIN_MAX_WORKERS 8
+
+typedef struct {
+  VP8LHashChain* p;
+  const int32_t* chain;
+  const uint32_t* argb;
+  int size;
+  int xsize;
+  int iter_max;
+  uint32_t window_size;
+  int low_effort;
+  int first_chunk;
+  int num_workers;
+} HashChainFillJob;
+
+static int HashChainFillJobHook(void* arg1, void* arg2) {
+  const HashChainFillJob* const job = (const HashChainFillJob*)arg1;
+  int chunk;
+  (void)arg2;
+  for (chunk = job->first_chunk;
+       1 + chunk * MT_HASH_CHAIN_CHUNK_SIZE <= job->size - 2;
+       chunk += job->num_workers) {
+    const int lo = 1 + chunk * MT_HASH_CHAIN_CHUNK_SIZE;
+    int from = lo + MT_HASH_CHAIN_CHUNK_SIZE - 1;
+    if (from > job->size - 2) from = job->size - 2;
+    HashChainFillSearch(job->p, job->chain, job->argb, job->size, job->xsize,
+                        job->iter_max, job->window_size, job->low_effort, lo,
+                        from, /*pic=*/NULL, /*percent_range=*/0,
+                        /*percent_start=*/0, /*percent=*/NULL);
+  }
+  return 1;
+}
+
+// Multi-threaded version of the match search: the chain is copied so that the
+// workers can write their match intervals to p->offset_length (which holds
+// the chain links in the single-threaded version) independently.
+// Returns 0 if multi-threading could not be used (missing memory or thread
+// resources): the caller should then fall back to the single-threaded search.
+static int HashChainFillSearchMT(VP8LHashChain* const p,
+                                 const uint32_t* const argb, int size,
+                                 int xsize, int iter_max, uint32_t window_size,
+                                 int low_effort) {
+  const int num_chunks =
+      (size - 2 + MT_HASH_CHAIN_CHUNK_SIZE - 1) / MT_HASH_CHAIN_CHUNK_SIZE;
+  const int num_workers = (num_chunks < MT_HASH_CHAIN_MAX_WORKERS)
+                              ? num_chunks
+                              : MT_HASH_CHAIN_MAX_WORKERS;
+  const WebPWorkerInterface* const worker_interface = WebPGetWorkerInterface();
+  WebPWorker workers[MT_HASH_CHAIN_MAX_WORKERS];
+  HashChainFillJob jobs[MT_HASH_CHAIN_MAX_WORKERS];
+  int i, ok = 1;
+  int32_t* const chain =
+      (int32_t*)WebPSafeMalloc(size, sizeof(*chain));
+  if (chain == NULL) return 0;
+  memcpy(chain, p->offset_length, size * sizeof(*chain));
+
+  for (i = 0; i < num_workers; ++i) {
+    jobs[i].p = p;
+    jobs[i].chain = chain;
+    jobs[i].argb = argb;
+    jobs[i].size = size;
+    jobs[i].xsize = xsize;
+    jobs[i].iter_max = iter_max;
+    jobs[i].window_size = window_size;
+    jobs[i].low_effort = low_effort;
+    jobs[i].first_chunk = i;
+    jobs[i].num_workers = num_workers;
+    worker_interface->Init(&workers[i]);
+    workers[i].data1 = &jobs[i];
+    workers[i].data2 = NULL;
+    workers[i].hook = HashChainFillJobHook;
+  }
+  for (i = 0; ok && i < num_workers; ++i) {
+    ok = worker_interface->Reset(&workers[i]);
+  }
+  if (ok) {
+    p->offset_length[0] = p->offset_length[size - 1] = 0;
+    for (i = 0; i < num_workers; ++i) {
+      worker_interface->Launch(&workers[i]);
+    }
+    for (i = 0; i < num_workers; ++i) {
+      ok &= worker_interface->Sync(&workers[i]);
+    }
+  }
+  for (i = 0; i < num_workers; ++i) {
+    worker_interface->End(&workers[i]);
+  }
+  WebPSafeFree(chain);
+  return ok;
+}
+
+#endif  // WEBP_EXPERIMENTAL_MT_HASH_CHAIN
+
 int VP8LHashChainFill(VP8LHashChain* const p, int quality,
                       const uint32_t* const argb, int xsize, int ysize,
-                      int low_effort, const WebPPicture* const pic,
-                      int percent_range, int* const percent) {
+                      int low_effort, int use_threads,
+                      const WebPPicture* const pic, int percent_range,
+                      int* const percent) {
   const int size = xsize * ysize;
   const int iter_max = GetMaxItersForQuality(quality);
   const uint32_t window_size = GetWindowSizeForHashChain(quality, xsize);
@@ -263,13 +479,13 @@ int VP8LHashChainFill(VP8LHashChain* const p, int quality,
   int percent_start = *percent;
   int pos;
   int argb_comp;
-  uint32_t base_position;
   int32_t* hash_to_first_index;
   // Temporarily use the p->offset_length as a hash chain.
   int32_t* chain = (int32_t*)p->offset_length;
   assert(size > 0);
   assert(p->size != 0);
   assert(p->offset_length != NULL);
+  (void)use_threads;
 
   if (size <= 2) {
     p->offset_length[0] = p->offset_length[size - 1] = 0;
@@ -351,97 +567,20 @@ int VP8LHashChainFill(VP8LHashChain* const p, int quality,
   // (hence a best length of 0) and the left-most pixel nothing to the left
   // (hence an offset of 0).
   assert(size > 2);
+#if defined(WEBP_EXPERIMENTAL_MT_HASH_CHAIN)
+  if (use_threads > 0 && size - 2 > MT_HASH_CHAIN_CHUNK_SIZE) {
+    if (HashChainFillSearchMT(p, argb, size, xsize, iter_max, window_size,
+                              low_effort)) {
+      return WebPReportProgress(pic, percent_start + percent_range, percent);
+    }
+    // else fall back to the single-threaded search below.
+  }
+#endif
   p->offset_length[0] = p->offset_length[size - 1] = 0;
-  for (base_position = size - 2; base_position > 0;) {
-    const int max_len = MaxFindCopyLength(size - 1 - base_position);
-    const uint32_t* const argb_start = argb + base_position;
-    int iter = iter_max;
-    int best_length = 0;
-    uint32_t best_distance = 0;
-    uint32_t best_argb;
-    const int min_pos =
-        (base_position > window_size) ? base_position - window_size : 0;
-    const int length_max = (max_len < 256) ? max_len : 256;
-    uint32_t max_base_position;
-
-    pos = chain[base_position];
-    if (!low_effort) {
-      int curr_length;
-      // Heuristic: use the comparison with the above line as an initialization.
-      if (base_position >= (uint32_t)xsize) {
-        curr_length = FindMatchLength(argb_start - xsize, argb_start,
-                                      best_length, max_len);
-        if (curr_length > best_length) {
-          best_length = curr_length;
-          best_distance = xsize;
-        }
-        --iter;
-      }
-      // Heuristic: compare to the previous pixel.
-      curr_length =
-          FindMatchLength(argb_start - 1, argb_start, best_length, max_len);
-      if (curr_length > best_length) {
-        best_length = curr_length;
-        best_distance = 1;
-      }
-      --iter;
-      // Skip the for loop if we already have the maximum.
-      if (best_length == MAX_LENGTH) pos = min_pos - 1;
-    }
-    best_argb = argb_start[best_length];
-
-    for (; pos >= min_pos && --iter; pos = chain[pos]) {
-      int curr_length;
-      assert(base_position > (uint32_t)pos);
-
-      if (argb[pos + best_length] != best_argb) continue;
-
-      curr_length = VP8LVectorMismatch(argb + pos, argb_start, max_len);
-      if (best_length < curr_length) {
-        best_length = curr_length;
-        best_distance = base_position - pos;
-        best_argb = argb_start[best_length];
-        // Stop if we have reached a good enough length.
-        if (best_length >= length_max) break;
-      }
-    }
-    // We have the best match but in case the two intervals continue matching
-    // to the left, we have the best matches for the left-extended pixels.
-    max_base_position = base_position;
-    while (1) {
-      assert(best_length <= MAX_LENGTH);
-      assert(best_distance <= WINDOW_SIZE);
-      p->offset_length[base_position] =
-          (best_distance << MAX_LENGTH_BITS) | (uint32_t)best_length;
-      --base_position;
-      // Stop if we don't have a match or if we are out of bounds.
-      if (best_distance == 0 || base_position == 0) break;
-      // Stop if we cannot extend the matching intervals to the left.
-      if (base_position < best_distance ||
-          argb[base_position - best_distance] != argb[base_position]) {
-        break;
-      }
-      // Stop if we are matching at its limit because there could be a closer
-      // matching interval with the same maximum length. Then again, if the
-      // matching interval is as close as possible (best_distance == 1), we will
-      // never find anything better so let's continue.
-      if (best_length == MAX_LENGTH && best_distance != 1 &&
-          base_position + MAX_LENGTH < max_base_position) {
-        break;
-      }
-      if (best_length < MAX_LENGTH) {
-        ++best_length;
-        max_base_position = base_position;
-      }
-    }
-
-    if (!WebPReportProgress(pic,
-                            percent_start + percent_range *
-                                                (size - 2 - base_position) /
-                                                (size - 2),
-                            percent)) {
-      return 0;
-    }
+  if (!HashChainFillSearch(p, chain, argb, size, xsize, iter_max, window_size,
+                           low_effort, /*lo=*/1, /*from=*/size - 2, pic,
+                           percent_range, percent_start, percent)) {
+    return 0;
   }
 
   return WebPReportProgress(pic, percent_start + percent_range, percent);

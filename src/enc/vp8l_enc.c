@@ -768,7 +768,7 @@ static int EncodeImageNoHuffman(VP8LBitWriter* const bw,
 
   // Calculate backward references from ARGB image.
   if (!VP8LHashChainFill(hash_chain, quality, argb, width, height, low_effort,
-                         pic, percent_range / 2, percent)) {
+                         /*use_threads=*/0, pic, percent_range / 2, percent)) {
     goto Error;
   }
   if (!VP8LGetBackwardReferences(width, height, argb, quality, /*low_effort=*/0,
@@ -840,10 +840,10 @@ Error:
 static int EncodeImageInternal(
     VP8LBitWriter* const bw, const uint32_t* const argb,
     VP8LHashChain* const hash_chain, VP8LBackwardRefs refs_array[4], int width,
-    int height, int quality, int low_effort, const CrunchConfig* const config,
-    int* cache_bits, int histogram_bits_in, size_t init_byte_position,
-    int* const hdr_size, int* const data_size, const WebPPicture* const pic,
-    int percent_range, int* const percent) {
+    int height, int quality, int low_effort, int use_threads,
+    const CrunchConfig* const config, int* cache_bits, int histogram_bits_in,
+    size_t init_byte_position, int* const hdr_size, int* const data_size,
+    const WebPPicture* const pic, int percent_range, int* const percent) {
   const uint32_t histogram_image_xysize =
       VP8LSubSampleSize(width, histogram_bits_in) *
       VP8LSubSampleSize(height, histogram_bits_in);
@@ -885,7 +885,7 @@ static int EncodeImageInternal(
 
   percent_range = remaining_percent / 5;
   if (!VP8LHashChainFill(hash_chain, quality, argb, width, height, low_effort,
-                         pic, percent_range, percent)) {
+                         use_threads, pic, percent_range, percent)) {
     goto Error;
   }
   percent_start += percent_range;
@@ -1623,9 +1623,10 @@ static int EncodeStreamHook(void* input, void* data2) {
     // Encode and write the transformed image.
     if (!EncodeImageInternal(
             bw, enc->argb, &enc->hash_chain, enc->refs, enc->current_width,
-            height, quality, low_effort, &crunch_configs[idx], &enc->cache_bits,
-            enc->histo_bits, byte_position, &hdr_size, &data_size, picture,
-            remaining_percent, &percent)) {
+            height, quality, low_effort, config->thread_level,
+            &crunch_configs[idx], &enc->cache_bits, enc->histo_bits,
+            byte_position, &hdr_size, &data_size, picture, remaining_percent,
+            &percent)) {
       goto Error;
     }
 
