@@ -87,6 +87,16 @@ static void TransformColor_AVX2(const VP8LMultipliers* WEBP_RESTRICT const m,
 
 //------------------------------------------------------------------------------
 #define SPAN 16
+
+// Returns true if all the 32-bit lanes of 'E' are equal. In that case, the
+// 8 values it holds can be added to the histogram in one go; this is faster
+// on uniform areas and, more importantly, it breaks the load-add-store
+// dependency chain on a single histogram entry.
+static WEBP_INLINE int AllLanesEqual_AVX2(const __m256i E) {
+  const __m256i first = _mm256_broadcastd_epi32(_mm256_castsi256_si128(E));
+  return (_mm256_movemask_epi8(_mm256_cmpeq_epi8(E, first)) == -1);
+}
+
 static void CollectColorBlueTransforms_AVX2(const uint32_t* WEBP_RESTRICT argb,
                                             int stride, int tile_width,
                                             int tile_height, int green_to_blue,
@@ -110,15 +120,23 @@ static void CollectColorBlueTransforms_AVX2(const uint32_t* WEBP_RESTRICT argb,
       for (x = 8; x + 8 <= tile_width; x += 8) {
         const __m256i A2 = _mm256_loadu_si256((const __m256i*)(src + x));
         __m256i B2, C2, D2;
-        _mm256_storeu_si256((__m256i*)values, E);
-        for (i = 0; i < 32; i += 4) ++histo[values[i]];
+        if (AllLanesEqual_AVX2(E)) {
+          histo[(uint8_t)_mm256_cvtsi256_si32(E)] += 8;
+        } else {
+          _mm256_storeu_si256((__m256i*)values, E);
+          for (i = 0; i < 32; i += 4) ++histo[values[i]];
+        }
         B2 = _mm256_shuffle_epi8(A2, perm);
         C2 = _mm256_mulhi_epi16(B2, mult);
         D2 = _mm256_sub_epi16(A2, C2);
         E = _mm256_add_epi16(_mm256_srli_epi32(D2, 16), D2);
       }
-      _mm256_storeu_si256((__m256i*)values, E);
-      for (i = 0; i < 32; i += 4) ++histo[values[i]];
+      if (AllLanesEqual_AVX2(E)) {
+        histo[(uint8_t)_mm256_cvtsi256_si32(E)] += 8;
+      } else {
+        _mm256_storeu_si256((__m256i*)values, E);
+        for (i = 0; i < 32; i += 4) ++histo[values[i]];
+      }
     }
   }
   {
@@ -150,14 +168,22 @@ static void CollectColorRedTransforms_AVX2(const uint32_t* WEBP_RESTRICT argb,
       for (x = 8; x + 8 <= tile_width; x += 8) {
         const __m256i A2 = _mm256_loadu_si256((const __m256i*)(src + x));
         __m256i B2, C2;
-        _mm256_storeu_si256((__m256i*)values, D);
-        for (i = 2; i < 32; i += 4) ++histo[values[i]];
+        if (AllLanesEqual_AVX2(D)) {
+          histo[(uint8_t)((uint32_t)_mm256_cvtsi256_si32(D) >> 16)] += 8;
+        } else {
+          _mm256_storeu_si256((__m256i*)values, D);
+          for (i = 2; i < 32; i += 4) ++histo[values[i]];
+        }
         B2 = _mm256_and_si256(A2, mask_g);
         C2 = _mm256_madd_epi16(B2, mult);
         D = _mm256_sub_epi16(A2, C2);
       }
-      _mm256_storeu_si256((__m256i*)values, D);
-      for (i = 2; i < 32; i += 4) ++histo[values[i]];
+      if (AllLanesEqual_AVX2(D)) {
+        histo[(uint8_t)((uint32_t)_mm256_cvtsi256_si32(D) >> 16)] += 8;
+      } else {
+        _mm256_storeu_si256((__m256i*)values, D);
+        for (i = 2; i < 32; i += 4) ++histo[values[i]];
+      }
     }
   }
   {
