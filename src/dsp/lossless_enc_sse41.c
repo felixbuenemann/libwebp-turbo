@@ -77,6 +77,26 @@ static void SubtractGreenFromBlueAndRed_SSE41(uint32_t* argb_data,
 #define MK_CST_16(HI, LO) \
   _mm_set1_epi32((int)(((uint32_t)(HI) << 16) | ((LO) & 0xffff)))
 
+// Adds the 4 values (one per byte of 'v') to 'histo'. Batches of identical
+// values are added in one go; this is faster on uniform areas and, more
+// importantly, it breaks the load-add-store dependency chain on a single
+// histogram entry.
+static WEBP_INLINE void AccumulateHisto4_SSE41(uint32_t v, uint32_t histo[]) {
+  if (v == ((v >> 8) | (v << 24))) {  // all bytes equal
+    histo[v & 0xff] += 4;
+  } else {
+    int k;
+    for (k = 0; k < 4; ++k) ++histo[(v >> (8 * k)) & 0xff];
+  }
+}
+
+// Packs the bytes of 'E' selected by 'pack_idx' (one per 32-bit lane) as a
+// 4 byte value.
+static WEBP_INLINE uint32_t Pack4Values_SSE41(const __m128i E,
+                                              const __m128i pack_idx) {
+  return (uint32_t)_mm_cvtsi128_si32(_mm_shuffle_epi8(E, pack_idx));
+}
+
 static void CollectColorBlueTransforms_SSE41(const uint32_t* WEBP_RESTRICT argb,
                                              int stride, int tile_width,
                                              int tile_height, int green_to_blue,
@@ -86,6 +106,8 @@ static void CollectColorBlueTransforms_SSE41(const uint32_t* WEBP_RESTRICT argb,
       MK_CST_16(CST_5b(red_to_blue) + 256, CST_5b(green_to_blue));
   const __m128i perm =
       _mm_setr_epi8(-1, 1, -1, 2, -1, 5, -1, 6, -1, 9, -1, 10, -1, 13, -1, 14);
+  const __m128i pack_idx = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1,
+                                         -1, -1, -1, -1, -1, -1);
   if (tile_width >= 4) {
     int y;
     for (y = 0; y < tile_height; ++y) {
@@ -99,19 +121,13 @@ static void CollectColorBlueTransforms_SSE41(const uint32_t* WEBP_RESTRICT argb,
       for (x = 4; x + 4 <= tile_width; x += 4) {
         const __m128i A2 = _mm_loadu_si128((const __m128i*)(src + x));
         __m128i B2, C2, D2;
-        ++histo[_mm_extract_epi8(E, 0)];
+        AccumulateHisto4_SSE41(Pack4Values_SSE41(E, pack_idx), histo);
         B2 = _mm_shuffle_epi8(A2, perm);
-        ++histo[_mm_extract_epi8(E, 4)];
         C2 = _mm_mulhi_epi16(B2, mult);
-        ++histo[_mm_extract_epi8(E, 8)];
         D2 = _mm_sub_epi16(A2, C2);
-        ++histo[_mm_extract_epi8(E, 12)];
         E = _mm_add_epi16(_mm_srli_epi32(D2, 16), D2);
       }
-      ++histo[_mm_extract_epi8(E, 0)];
-      ++histo[_mm_extract_epi8(E, 4)];
-      ++histo[_mm_extract_epi8(E, 8)];
-      ++histo[_mm_extract_epi8(E, 12)];
+      AccumulateHisto4_SSE41(Pack4Values_SSE41(E, pack_idx), histo);
     }
   }
   {
@@ -130,6 +146,8 @@ static void CollectColorRedTransforms_SSE41(const uint32_t* WEBP_RESTRICT argb,
                                             uint32_t histo[]) {
   const __m128i mult = MK_CST_16(0, CST_5b(green_to_red));
   const __m128i mask_g = _mm_set1_epi32(0x0000ff00);
+  const __m128i pack_idx = _mm_setr_epi8(2, 6, 10, 14, -1, -1, -1, -1, -1, -1,
+                                         -1, -1, -1, -1, -1, -1);
   if (tile_width >= 4) {
     int y;
     for (y = 0; y < tile_height; ++y) {
@@ -142,18 +160,12 @@ static void CollectColorRedTransforms_SSE41(const uint32_t* WEBP_RESTRICT argb,
       for (x = 4; x + 4 <= tile_width; x += 4) {
         const __m128i A2 = _mm_loadu_si128((const __m128i*)(src + x));
         __m128i B2, C2;
-        ++histo[_mm_extract_epi8(D, 2)];
+        AccumulateHisto4_SSE41(Pack4Values_SSE41(D, pack_idx), histo);
         B2 = _mm_and_si128(A2, mask_g);
-        ++histo[_mm_extract_epi8(D, 6)];
         C2 = _mm_madd_epi16(B2, mult);
-        ++histo[_mm_extract_epi8(D, 10)];
-        ++histo[_mm_extract_epi8(D, 14)];
         D = _mm_sub_epi16(A2, C2);
       }
-      ++histo[_mm_extract_epi8(D, 2)];
-      ++histo[_mm_extract_epi8(D, 6)];
-      ++histo[_mm_extract_epi8(D, 10)];
-      ++histo[_mm_extract_epi8(D, 14)];
+      AccumulateHisto4_SSE41(Pack4Values_SSE41(D, pack_idx), histo);
     }
   }
   {

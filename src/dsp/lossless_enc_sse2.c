@@ -85,6 +85,28 @@ static void TransformColor_SSE2(const VP8LMultipliers* WEBP_RESTRICT const m,
 
 //------------------------------------------------------------------------------
 #define SPAN 8
+
+// Adds the 8 values (one per byte of 'v') to 'histo'. Batches of identical
+// values are added in one go; this is faster on uniform areas and, more
+// importantly, it breaks the load-add-store dependency chain on a single
+// histogram entry.
+static WEBP_INLINE void AccumulateHisto8_SSE2(uint64_t v, uint32_t histo[]) {
+  if (v == ((v >> 8) | (v << 56))) {  // all bytes equal
+    histo[v & 0xff] += SPAN;
+  } else {
+    int k;
+    for (k = 0; k < SPAN; ++k) ++histo[(v >> (8 * k)) & 0xff];
+  }
+}
+
+// Packs the 8 16-bit values of 'I' (in [0, 255]) as 8 bytes.
+static WEBP_INLINE uint64_t Pack8Values_SSE2(const __m128i I) {
+  const __m128i J = _mm_packus_epi16(I, I);
+  const uint32_t lo = (uint32_t)_mm_cvtsi128_si32(J);
+  const uint32_t hi = (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(J, 4));
+  return lo | ((uint64_t)hi << 32);
+}
+
 static void CollectColorBlueTransforms_SSE2(const uint32_t* WEBP_RESTRICT argb,
                                             int stride, int tile_width,
                                             int tile_height, int green_to_blue,
@@ -96,9 +118,8 @@ static void CollectColorBlueTransforms_SSE2(const uint32_t* WEBP_RESTRICT argb,
   int y;
   for (y = 0; y < tile_height; ++y) {
     const uint32_t* const src = argb + y * stride;
-    int i, x;
+    int x;
     for (x = 0; x + SPAN <= tile_width; x += SPAN) {
-      uint16_t values[SPAN];
       const __m128i in0 = _mm_loadu_si128((__m128i*)&src[x + 0]);
       const __m128i in1 = _mm_loadu_si128((__m128i*)&src[x + SPAN / 2]);
       const __m128i A0 = _mm_slli_epi16(in0, 8);  // r 0  | b 0
@@ -118,8 +139,7 @@ static void CollectColorBlueTransforms_SSE2(const uint32_t* WEBP_RESTRICT argb,
       const __m128i H0 = _mm_and_si128(G0, mask_b);  // 0 0  | 0 b
       const __m128i H1 = _mm_and_si128(G1, mask_b);
       const __m128i I = _mm_packs_epi32(H0, H1);  // 0 b' | 0 b'
-      _mm_storeu_si128((__m128i*)values, I);
-      for (i = 0; i < SPAN; ++i) ++histo[values[i]];
+      AccumulateHisto8_SSE2(Pack8Values_SSE2(I), histo);
     }
   }
   {
@@ -143,9 +163,8 @@ static void CollectColorRedTransforms_SSE2(const uint32_t* WEBP_RESTRICT argb,
   int y;
   for (y = 0; y < tile_height; ++y) {
     const uint32_t* const src = argb + y * stride;
-    int i, x;
+    int x;
     for (x = 0; x + SPAN <= tile_width; x += SPAN) {
-      uint16_t values[SPAN];
       const __m128i in0 = _mm_loadu_si128((__m128i*)&src[x + 0]);
       const __m128i in1 = _mm_loadu_si128((__m128i*)&src[x + SPAN / 2]);
       const __m128i A0 = _mm_and_si128(in0, mask_g);  // 0 0  | g 0
@@ -159,8 +178,7 @@ static void CollectColorRedTransforms_SSE2(const uint32_t* WEBP_RESTRICT argb,
       const __m128i F0 = _mm_and_si128(E0, mask);  // 0 0  | 0 r'
       const __m128i F1 = _mm_and_si128(E1, mask);
       const __m128i I = _mm_packs_epi32(F0, F1);
-      _mm_storeu_si128((__m128i*)values, I);
-      for (i = 0; i < SPAN; ++i) ++histo[values[i]];
+      AccumulateHisto8_SSE2(Pack8Values_SSE2(I), histo);
     }
   }
   {
