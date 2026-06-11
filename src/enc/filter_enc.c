@@ -113,7 +113,12 @@ static void DoFilter(const VP8EncIterator* const it, int level) {
 //------------------------------------------------------------------------------
 // SSIM metric for one macroblock
 
-static double GetMBSSIM(const uint8_t* yuv1, const uint8_t* yuv2) {
+// Fixed-point precision used to accumulate the per-macroblock SSIM scores in
+// LFStats. The macroblock score is bounded by the number of windows (172), so
+// the worst-case total (172 * 2^32 * 1024 * 1024 macroblocks) fits an int64_t.
+#define LF_STATS_FIX 32
+
+static int64_t GetMBSSIM(const uint8_t* yuv1, const uint8_t* yuv2) {
   int x, y;
   double sum = 0.;
 
@@ -132,7 +137,7 @@ static double GetMBSSIM(const uint8_t* yuv1, const uint8_t* yuv2) {
                                y, 8, 8);
     }
   }
-  return sum;
+  return (int64_t)(sum * ((int64_t)1 << LF_STATS_FIX) + .5);
 }
 
 #endif  // !defined(WEBP_REDUCE_SIZE)
@@ -203,9 +208,10 @@ void VP8AdjustFilterStrength(VP8EncIterator* const it) {
     for (s = 0; s < NUM_MB_SEGMENTS; s++) {
       int i, best_level = 0;
       // Improvement over filter level 0 should be at least 1e-5 (relatively)
-      double best_v = 1.00001 * (*it->lf_stats)[s][0];
+      const int64_t v0 = (*it->lf_stats)[s][0];
+      int64_t best_v = v0 + v0 / 100000;
       for (i = 1; i < MAX_LF_LEVELS; i++) {
-        const double v = (*it->lf_stats)[s][i];
+        const int64_t v = (*it->lf_stats)[s][i];
         if (v > best_v) {
           best_v = v;
           best_level = i;

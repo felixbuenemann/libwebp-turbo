@@ -884,6 +884,7 @@ typedef struct {
   uint64_t size_p0;
   uint64_t distortion;
   SideInfoSums side_sums;
+  LFStats lf_stats;  // auto-filter statistics (fixed-point: order-free merge)
 } VP8WavefrontWorker;
 
 struct VP8WavefrontCtx {
@@ -938,6 +939,7 @@ static int WavefrontProcessRow(VP8WavefrontWorker* const w,
     w->distortion += info.D;
     if (ctx->is_last_pass) {
       StoreSideInfo(it, &w->side_sums);
+      VP8StoreFilterStats(it);
       VP8IteratorExport(it);
     }
     VP8IteratorSaveBoundary(it);
@@ -985,6 +987,9 @@ static int WavefrontWorkerHook(void* arg1, void* arg2) {
   // Note: VP8IteratorInit() would reset the shared top boundary conditions,
   // racing with the rows being processed by the other threads.
   VP8IteratorInitWorker(w->ctx->enc, &it);
+  if (it.lf_stats != NULL) {
+    it.lf_stats = &w->lf_stats;  // accumulate the auto-filter stats privately
+  }
   WavefrontWorkLoop(w, &it);
   // 'max_edge' is a maximum: merging it under the lock makes the result
   // independent of the workers' ordering.
@@ -1026,6 +1031,7 @@ static int WavefrontOnePass(VP8WavefrontCtx* const ctx,
     w->size_p0 = 0;
     w->distortion = 0;
     memset(&w->side_sums, 0, sizeof(w->side_sums));
+    memset(&w->lf_stats, 0, sizeof(w->lf_stats));
   }
   for (i = 1; i < ctx->num_threads; ++i) {
     winterface->Launch(&ctx->threads[i - 1]);
@@ -1090,6 +1096,20 @@ static int WavefrontOnePass(VP8WavefrontCtx* const ctx,
     *distortion += w->distortion;
     if (is_last_pass) MergeSideInfoSums(side_sums, &w->side_sums);
   }
+  // Merge the auto-filter statistics. The sums are fixed-point integers, so
+  // the result does not depend on which worker processed which row. The
+  // calling thread accumulated directly into 'enc->lf_stats'.
+  if (is_last_pass && enc->lf_stats != NULL) {
+    int s, j;
+    for (i = 1; i < ctx->num_threads; ++i) {
+      const VP8WavefrontWorker* const w = &ctx->workers[i];
+      for (s = 0; s < NUM_MB_SEGMENTS; ++s) {
+        for (j = 0; j < MAX_LF_LEVELS; ++j) {
+          (*enc->lf_stats)[s][j] += w->lf_stats[s][j];
+        }
+      }
+    }
+  }
   if (!ok && enc->pic->error_code == VP8_ENC_OK) {
     WebPEncodingSetError(enc->pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
   }
@@ -1129,9 +1149,6 @@ static VP8WavefrontCtx* WavefrontNew(VP8Encoder* const enc,
   int num_threads = WAVEFRONT_MAX_THREADS;
   int i;
   if (enc->thread_level <= 0) return NULL;
-  // The floating-point filter statistics would not accumulate in a defined
-  // order: leave auto-filter to the single-threaded loop.
-  if (enc->lf_stats != NULL) return NULL;
   if (enc->mb_h < WAVEFRONT_MIN_MB_ROWS) return NULL;
   if (num_threads > (enc->mb_h + 1) / 2) num_threads = (enc->mb_h + 1) / 2;
 

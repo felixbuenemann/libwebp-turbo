@@ -135,7 +135,10 @@ typedef proba_t StatsArray[NUM_CTX][NUM_PROBAS];
 typedef uint16_t CostArray[NUM_CTX][MAX_VARIABLE_LEVEL + 1];
 typedef const uint16_t* (*CostArrayPtr)[NUM_CTX];  // for easy casting
 typedef const uint16_t* CostArrayMap[16][NUM_CTX];
-typedef double LFStats[NUM_MB_SEGMENTS][MAX_LF_LEVELS];  // filter stats
+// Filter stats: cumulated SSIM scores per segment and filter level, in
+// LF_STATS_FIX fixed-point. Integer accumulation is exact in any order,
+// which keeps the multi-threaded loop bit-exact with the single-threaded one.
+typedef int64_t LFStats[NUM_MB_SEGMENTS][MAX_LF_LEVELS];
 
 typedef struct VP8Encoder VP8Encoder;
 
