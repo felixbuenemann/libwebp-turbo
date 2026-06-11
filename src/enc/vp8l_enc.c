@@ -1093,8 +1093,8 @@ static int ApplyPredictFilter(VP8LEncoder* const enc, int width, int height,
   if (!VP8LResidualImage(width, height, min_bits, max_bits, low_effort,
                          enc->argb, enc->argb_scratch, enc->transform_data,
                          near_lossless_strength, enc->config->exact,
-                         used_subtract_green, enc->pic, percent_range / 2,
-                         percent, best_bits)) {
+                         used_subtract_green, enc->config->thread_level > 0,
+                         enc->pic, percent_range / 2, percent, best_bits)) {
     return 0;
   }
   VP8LPutBits(bw, TRANSFORM_PRESENT, 1);

@@ -22,6 +22,7 @@
 #include "src/dsp/lossless_common.h"
 #include "src/enc/vp8i_enc.h"
 #include "src/enc/vp8li_enc.h"
+#include "src/utils/thread_utils.h"
 #include "src/utils/utils.h"
 #include "src/webp/encode.h"
 #include "src/webp/format_constants.h"
@@ -345,8 +346,9 @@ static WEBP_INLINE uint32_t* GetAccumulatedHisto(uint32_t* all_accumulated,
 }
 
 // Find and store the best predictor for a tile at subsampling
-// 'subsampling_index'.
-static void GetBestPredictorForTile(const uint32_t* const all_argb,
+// 'subsampling_index'. 'tile_histos' are the kNumPredModes residual
+// histograms of the tile (HISTO_SIZE each).
+static void GetBestPredictorForTile(const uint32_t* const tile_histos,
                                     int subsampling_index, int tile_x,
                                     int tile_y, int tiles_per_row,
                                     uint32_t* all_accumulated_argb,
@@ -367,11 +369,9 @@ static void GetBestPredictorForTile(const uint32_t* const all_argb,
   int mode;
   int64_t best_diff = WEBP_INT64_MAX;
   uint32_t best_mode = 0;
-  const uint32_t* best_histo =
-      GetHistoArgbConst(all_argb, /*subsampling_index=*/0, best_mode);
+  const uint32_t* best_histo = tile_histos;
   for (mode = 0; mode < kNumPredModes; ++mode) {
-    const uint32_t* const histo_argb =
-        GetHistoArgbConst(all_argb, subsampling_index, mode);
+    const uint32_t* const histo_argb = &tile_histos[mode * HISTO_SIZE];
     const int64_t cur_diff = PredictionCostSpatialHistogram(
         accumulated_argb, histo_argb, mode, left_mode, above_mode);
 
@@ -631,10 +631,253 @@ void VP8LOptimizeSampling(uint32_t* const image, int full_width,
 // When computing the residuals for a tile, the histogram of the above
 // super-tile is updated. If this super-tile is finished, its histogram is used
 // to update the histogram of the next super-tile and so on up to the max-tile.
+// State of the Z-order traversal of the smallest tiles used by
+// GetBestPredictorsAndSubSampling(): within a max-tile (a square of
+// (1 << max_subsampling_index) tiles), the tiles are visited in Z-order so
+// that the super-tiles complete as early as possible.
+typedef struct {
+  uint32_t tiles_per_row, tiles_per_col;
+  uint32_t max_subsampling_index;
+  uint32_t max_tile_size;               // in smallest-tile units
+  uint32_t tile_x, tile_y;              // current tile
+  uint32_t local_tile_x, local_tile_y;  // coordinates within the max-tile
+  uint32_t max_tile_x, max_tile_y;      // coordinates of the max-tile
+  uint32_t num_completed;  // number of super-tiles the current tile completes
+} TileTraversal;
+
+// Number of subsampling levels for which the current tile is the last one of
+// its super-tile (the smallest tile is at the end of a line/column of the
+// image or of a super-tile of size (1 << index)). Purely geometric.
+static uint32_t TileTraversalNumCompleted(const TileTraversal* const t) {
+  uint32_t idx;
+  for (idx = 1; idx <= t->max_subsampling_index; ++idx) {
+    if (!((t->tile_x == t->tiles_per_row - 1 ||
+           (t->local_tile_x + 1) % (1u << idx) == 0) &&
+          (t->tile_y == t->tiles_per_col - 1 ||
+           (t->local_tile_y + 1) % (1u << idx) == 0))) {
+      break;
+    }
+  }
+  return idx - 1;
+}
+
+static void TileTraversalInit(int width, int height, int min_bits,
+                              uint32_t max_subsampling_index,
+                              TileTraversal* const t) {
+  t->tiles_per_row = VP8LSubSampleSize(width, min_bits);
+  t->tiles_per_col = VP8LSubSampleSize(height, min_bits);
+  t->max_subsampling_index = max_subsampling_index;
+  t->max_tile_size = 1u << max_subsampling_index;
+  t->tile_x = t->tile_y = 0;
+  t->local_tile_x = t->local_tile_y = 0;
+  t->max_tile_x = t->max_tile_y = 0;
+  t->num_completed = TileTraversalNumCompleted(t);
+}
+
+static int TileTraversalDone(const TileTraversal* const t) {
+  return (t->tile_y >= t->tiles_per_col);
+}
+
+static void TileTraversalNext(TileTraversal* const t) {
+  if (t->num_completed == t->max_subsampling_index) {
+    // A new max-tile is started.
+    if (t->tile_x == t->tiles_per_row - 1) {
+      t->max_tile_x = 0;
+      ++t->max_tile_y;
+    } else {
+      ++t->max_tile_x;
+    }
+    t->local_tile_x = 0;
+    t->local_tile_y = 0;
+  } else {
+    // Proceed with the Z traversal.
+    uint32_t coord_x = t->local_tile_x >> t->num_completed;
+    uint32_t coord_y = t->local_tile_y >> t->num_completed;
+    if (t->tile_x == t->tiles_per_row - 1 && coord_x % 2 == 0) {
+      ++coord_y;
+    } else {
+      if (coord_x % 2 == 0) {
+        ++coord_x;
+      } else {
+        // Z traversal.
+        ++coord_y;
+        --coord_x;
+      }
+    }
+    t->local_tile_x = coord_x << t->num_completed;
+    t->local_tile_y = coord_y << t->num_completed;
+  }
+  t->tile_x = t->max_tile_x * t->max_tile_size + t->local_tile_x;
+  t->tile_y = t->max_tile_y * t->max_tile_size + t->local_tile_y;
+  if (!TileTraversalDone(t)) t->num_completed = TileTraversalNumCompleted(t);
+}
+
+#ifdef WEBP_USE_THREAD
+
+// Multi-threaded analysis: the per-tile residual histograms (the expensive
+// part) are computed by workers into a ring of slots following the traversal
+// order; the (strictly ordered) predictor selections are made by the calling
+// thread, consuming the slots in order. The histograms it accumulates are
+// integer sums of the same per-tile histograms as in the single-threaded
+// code, so the selections are identical.
+
+#define PRED_ANALYSIS_MAX_THREADS 8
+#define PRED_ANALYSIS_NUM_SLOTS 64   // ring slots (one per-tile histogram set)
+#define PRED_ANALYSIS_MIN_TILES 128  // don't bother below that many tiles
+
+typedef struct PredAnalysisCtx PredAnalysisCtx;
+
+typedef struct {
+  PredAnalysisCtx* ctx;
+  uint32_t* scratch;  // private prediction scratch (2 argb scanlines + bytes)
+} PredAnalysisWorker;
+
+struct PredAnalysisCtx {
+  int width, height, min_bits;
+  uint32_t max_subsampling_index;
+  const uint32_t* argb;
+  int max_quantization, exact, used_subtract_green;
+  uint32_t num_tiles;
+  uint32_t* slots;  // PRED_ANALYSIS_NUM_SLOTS histogram sets
+  void* monitor;
+  // Shared state, protected by the monitor.
+  uint32_t next_seq;  // next tile (in traversal order) to be claimed
+  uint32_t consumed;  // number of tiles processed by the consumer
+  uint32_t produced[PRED_ANALYSIS_NUM_SLOTS];  // tile index + 1, 0 if empty
+  int abort;
+  int num_workers;
+  PredAnalysisWorker workers[PRED_ANALYSIS_MAX_THREADS];
+  WebPWorker threads[PRED_ANALYSIS_MAX_THREADS];
+};
+
+static uint32_t* PredAnalysisSlot(const PredAnalysisCtx* const ctx,
+                                  uint32_t seq) {
+  return &ctx->slots[(seq % PRED_ANALYSIS_NUM_SLOTS) *
+                     (uint32_t)(kNumPredModes * HISTO_SIZE)];
+}
+
+static int PredAnalysisWorkerHook(void* arg1, void* arg2) {
+  PredAnalysisWorker* const w = (PredAnalysisWorker*)arg1;
+  PredAnalysisCtx* const ctx = w->ctx;
+  TileTraversal trav;
+  uint32_t trav_seq = 0;
+  (void)arg2;
+  TileTraversalInit(ctx->width, ctx->height, ctx->min_bits,
+                    ctx->max_subsampling_index, &trav);
+  while (1) {
+    uint32_t seq;
+    WebPMonitorLock(ctx->monitor);
+    while (!ctx->abort && ctx->next_seq < ctx->num_tiles &&
+           ctx->next_seq >= ctx->consumed + PRED_ANALYSIS_NUM_SLOTS) {
+      WebPMonitorWait(ctx->monitor);  // ring is full
+    }
+    if (ctx->abort || ctx->next_seq >= ctx->num_tiles) {
+      WebPMonitorUnlock(ctx->monitor);
+      break;
+    }
+    seq = ctx->next_seq++;
+    WebPMonitorUnlock(ctx->monitor);
+
+    while (trav_seq < seq) {  // advance the private traversal to 'seq'
+      TileTraversalNext(&trav);
+      ++trav_seq;
+    }
+    {
+      uint32_t* const slot = PredAnalysisSlot(ctx, seq);
+      memset(slot, 0, kNumPredModes * HISTO_SIZE * sizeof(*slot));
+      ComputeResidualsForTile(ctx->width, ctx->height, trav.tile_x,
+                              trav.tile_y, ctx->min_bits,
+                              /*update_up_to_index=*/0, slot, w->scratch,
+                              ctx->argb, ctx->max_quantization, ctx->exact,
+                              ctx->used_subtract_green);
+    }
+    WebPMonitorLock(ctx->monitor);
+    ctx->produced[seq % PRED_ANALYSIS_NUM_SLOTS] = seq + 1;
+    WebPMonitorBroadcast(ctx->monitor);
+    WebPMonitorUnlock(ctx->monitor);
+  }
+  return 1;
+}
+
+// Returns 1 on success, 0 if multi-threading could not be set up (the caller
+// then uses the single-threaded code).
+static int PredAnalysisStart(int width, int height, int min_bits,
+                             uint32_t max_subsampling_index,
+                             const uint32_t* const argb, int max_quantization,
+                             int exact, int used_subtract_green,
+                             uint32_t num_tiles, PredAnalysisCtx* const ctx) {
+  const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
+  const uint64_t scratch_size =
+      (width + 1) * 2 +
+      (width * 2 + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+  int i;
+  memset(ctx, 0, sizeof(*ctx));
+  ctx->width = width;
+  ctx->height = height;
+  ctx->min_bits = min_bits;
+  ctx->max_subsampling_index = max_subsampling_index;
+  ctx->argb = argb;
+  ctx->max_quantization = max_quantization;
+  ctx->exact = exact;
+  ctx->used_subtract_green = used_subtract_green;
+  ctx->num_tiles = num_tiles;
+  ctx->num_workers = PRED_ANALYSIS_MAX_THREADS;
+  ctx->monitor = WebPMonitorNew();
+  ctx->slots = (uint32_t*)WebPSafeMalloc(
+      PRED_ANALYSIS_NUM_SLOTS, kNumPredModes * HISTO_SIZE * sizeof(uint32_t));
+  if (ctx->monitor == NULL || ctx->slots == NULL) goto Error;
+  for (i = 0; i < ctx->num_workers; ++i) {
+    ctx->workers[i].ctx = ctx;
+    ctx->workers[i].scratch =
+        (uint32_t*)WebPSafeMalloc(scratch_size, sizeof(uint32_t));
+    if (ctx->workers[i].scratch == NULL) goto Error;
+  }
+  for (i = 0; i < ctx->num_workers; ++i) {
+    WebPWorker* const thread = &ctx->threads[i];
+    winterface->Init(thread);
+    thread->data1 = &ctx->workers[i];
+    thread->data2 = NULL;
+    thread->hook = PredAnalysisWorkerHook;
+    if (!winterface->Reset(thread)) {
+      ctx->num_workers = i;  // only End() the threads reset so far
+      goto Error;
+    }
+    winterface->Launch(thread);
+  }
+  return 1;
+
+ Error:
+  ctx->abort = 1;
+  return 0;
+}
+
+// Waits for the workers to finish and releases the resources.
+static void PredAnalysisEnd(PredAnalysisCtx* const ctx) {
+  const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
+  int i;
+  if (ctx->monitor != NULL) {
+    WebPMonitorLock(ctx->monitor);
+    ctx->consumed = ctx->num_tiles;  // unblock any waiting worker
+    WebPMonitorBroadcast(ctx->monitor);
+    WebPMonitorUnlock(ctx->monitor);
+  }
+  for (i = 0; i < ctx->num_workers; ++i) {
+    winterface->Sync(&ctx->threads[i]);
+    winterface->End(&ctx->threads[i]);
+  }
+  for (i = 0; i < PRED_ANALYSIS_MAX_THREADS; ++i) {
+    WebPSafeFree(ctx->workers[i].scratch);
+  }
+  WebPSafeFree(ctx->slots);
+  WebPMonitorDelete(ctx->monitor);
+}
+
+#endif  // WEBP_USE_THREAD
+
 static void GetBestPredictorsAndSubSampling(
     int width, int height, const int min_bits, const int max_bits,
     uint32_t* const argb_scratch, const uint32_t* const argb,
-    int max_quantization, int exact, int used_subtract_green,
+    int max_quantization, int exact, int used_subtract_green, int use_threads,
     const WebPPicture* const pic, int percent_range, int* const percent,
     uint32_t** const all_modes, int* best_bits, uint32_t** best_mode) {
   const uint32_t tiles_per_row = VP8LSubSampleSize(width, min_bits);
@@ -652,7 +895,6 @@ static void GetBestPredictorsAndSubSampling(
   uint32_t* const all_argb = raw_data;
   uint32_t* const all_accumulated_argb = all_argb + num_argb;
   uint32_t* const all_pred_histos = all_accumulated_argb + num_accumulated_rgb;
-  const int max_tile_size = 1 << max_subsampling_index;  // in tile size
   int percent_start = *percent;
   // When using the residuals of a tile for its super-tiles, you can either:
   // - use each residual to update the histogram of the super-tile, with a cost
@@ -665,98 +907,145 @@ static void GetBestPredictorsAndSubSampling(
   // individually added to the super-tile histogram.
   const uint32_t update_up_to_index =
       GetMax(GetMin(4, max_bits), min_bits) - min_bits;
-  // Coordinates in the max-tile in tile units.
-  uint32_t local_tile_x = 0, local_tile_y = 0;
-  uint32_t max_tile_x = 0, max_tile_y = 0;
-  uint32_t tile_x = 0, tile_y = 0;
+  TileTraversal trav;
+#ifdef WEBP_USE_THREAD
+  PredAnalysisCtx* mt = NULL;
+  uint32_t mt_seq = 0;
+#endif
 
   *best_bits = 0;
   *best_mode = NULL;
   if (raw_data == NULL) return;
 
-  while (tile_y < tiles_per_col) {
-    ComputeResidualsForTile(width, height, tile_x, tile_y, min_bits,
-                            update_up_to_index, all_argb, argb_scratch, argb,
-                            max_quantization, exact, used_subtract_green);
+  TileTraversalInit(width, height, min_bits, max_subsampling_index, &trav);
 
-    // Update all the super-tiles that are complete.
-    subsampling_index = 0;
-    while (1) {
-      const uint32_t super_tile_x = tile_x >> subsampling_index;
-      const uint32_t super_tile_y = tile_y >> subsampling_index;
-      const uint32_t super_tiles_per_row =
-          VP8LSubSampleSize(width, min_bits + subsampling_index);
-      GetBestPredictorForTile(all_argb, subsampling_index, super_tile_x,
-                              super_tile_y, super_tiles_per_row,
-                              all_accumulated_argb, all_modes, all_pred_histos);
-      if (subsampling_index == max_subsampling_index) break;
-
-      // Update the following super-tile histogram if it has not been updated
-      // yet.
-      ++subsampling_index;
-      if (subsampling_index > update_up_to_index &&
-          subsampling_index <= max_subsampling_index) {
-        VP8LAddVectorEq(
-            GetHistoArgbConst(all_argb, subsampling_index - 1, /*mode=*/0),
-            GetHistoArgb(all_argb, subsampling_index, /*mode=*/0),
-            HISTO_SIZE * kNumPredModes);
-      }
-      // Check whether the super-tile is not complete (if the smallest tile
-      // is not at the end of a line/column or at the beginning of a super-tile
-      // of size (1 << subsampling_index)).
-      if (!((tile_x == (tiles_per_row - 1) ||
-             (local_tile_x + 1) % (1 << subsampling_index) == 0) &&
-            (tile_y == (tiles_per_col - 1) ||
-             (local_tile_y + 1) % (1 << subsampling_index) == 0))) {
-        --subsampling_index;
-        // subsampling_index now is the index of the last finished super-tile.
-        break;
-      }
+#ifdef WEBP_USE_THREAD
+  if (use_threads && tiles_per_row * tiles_per_col >= PRED_ANALYSIS_MIN_TILES) {
+    mt = (PredAnalysisCtx*)WebPSafeMalloc(1ULL, sizeof(*mt));
+    if (mt != NULL &&
+        !PredAnalysisStart(width, height, min_bits, max_subsampling_index,
+                           argb, max_quantization, exact, used_subtract_green,
+                           tiles_per_row * tiles_per_col, mt)) {
+      PredAnalysisEnd(mt);  // could not start -> use the single-threaded code
+      WebPSafeFree(mt);
+      mt = NULL;
     }
-    // Reset all the histograms belonging to finished tiles.
-    memset(all_argb, 0,
-           HISTO_SIZE * kNumPredModes * (subsampling_index + 1) *
-               sizeof(*all_argb));
+  }
+#else
+  (void)use_threads;
+#endif
 
-    if (subsampling_index == max_subsampling_index) {
-      // If a new max-tile is started.
-      if (tile_x == (tiles_per_row - 1)) {
-        max_tile_x = 0;
-        ++max_tile_y;
-      } else {
-        ++max_tile_x;
+  while (!TileTraversalDone(&trav)) {
+    const uint32_t tile_x = trav.tile_x;
+    const uint32_t tile_y = trav.tile_y;
+    const uint32_t num_completed = trav.num_completed;
+    const uint32_t* tile_histos;
+
+#ifdef WEBP_USE_THREAD
+    if (mt != NULL) {
+      // Wait for the tile histograms computed by the workers.
+      uint32_t* const slot = PredAnalysisSlot(mt, mt_seq);
+      WebPMonitorLock(mt->monitor);
+      while (mt->produced[mt_seq % PRED_ANALYSIS_NUM_SLOTS] != mt_seq + 1) {
+        WebPMonitorWait(mt->monitor);
       }
-      local_tile_x = 0;
-      local_tile_y = 0;
-    } else {
-      // Proceed with the Z traversal.
-      uint32_t coord_x = local_tile_x >> subsampling_index;
-      uint32_t coord_y = local_tile_y >> subsampling_index;
-      if (tile_x == (tiles_per_row - 1) && coord_x % 2 == 0) {
-        ++coord_y;
-      } else {
-        if (coord_x % 2 == 0) {
-          ++coord_x;
-        } else {
-          // Z traversal.
-          ++coord_y;
-          --coord_x;
+      WebPMonitorUnlock(mt->monitor);
+      tile_histos = slot;
+      // Update the partial super-tile histograms: the first level gets the
+      // tile histograms, the next ones get the (then complete) histograms of
+      // the level below. The resulting sums are the same as in the
+      // single-threaded code.
+      for (subsampling_index = 1; subsampling_index <= max_subsampling_index;
+           ++subsampling_index) {
+        const uint32_t* const src =
+            (subsampling_index == 1)
+                ? slot
+                : GetHistoArgbConst(all_argb, subsampling_index - 1, 0);
+        VP8LAddVectorEq(src, GetHistoArgb(all_argb, subsampling_index, 0),
+                        HISTO_SIZE * kNumPredModes);
+        if (subsampling_index > num_completed) break;
+      }
+    } else
+#endif
+    {
+      ComputeResidualsForTile(width, height, tile_x, tile_y, min_bits,
+                              update_up_to_index, all_argb, argb_scratch, argb,
+                              max_quantization, exact, used_subtract_green);
+      tile_histos = GetHistoArgbConst(all_argb, 0, 0);
+      // Update the partial super-tile histograms that are not updated
+      // residual-per-residual by ComputeResidualsForTile().
+      for (subsampling_index = 1; subsampling_index <= max_subsampling_index;
+           ++subsampling_index) {
+        if (subsampling_index > update_up_to_index) {
+          VP8LAddVectorEq(
+              GetHistoArgbConst(all_argb, subsampling_index - 1, 0),
+              GetHistoArgb(all_argb, subsampling_index, 0),
+              HISTO_SIZE * kNumPredModes);
         }
+        if (subsampling_index > num_completed) break;
       }
-      local_tile_x = coord_x << subsampling_index;
-      local_tile_y = coord_y << subsampling_index;
     }
-    tile_x = max_tile_x * max_tile_size + local_tile_x;
-    tile_y = max_tile_y * max_tile_size + local_tile_y;
 
-    if (tile_x == 0 &&
+    // Find the best predictors of the tile and of all the super-tiles it
+    // completes.
+    GetBestPredictorForTile(tile_histos, 0, tile_x, tile_y, tiles_per_row,
+                            all_accumulated_argb, all_modes, all_pred_histos);
+    for (subsampling_index = 1; subsampling_index <= num_completed;
+         ++subsampling_index) {
+      GetBestPredictorForTile(
+          GetHistoArgbConst(all_argb, subsampling_index, 0), subsampling_index,
+          tile_x >> subsampling_index, tile_y >> subsampling_index,
+          VP8LSubSampleSize(width, min_bits + subsampling_index),
+          all_accumulated_argb, all_modes, all_pred_histos);
+    }
+
+    // Reset all the histograms belonging to finished tiles.
+#ifdef WEBP_USE_THREAD
+    if (mt != NULL) {
+      if (num_completed > 0) {
+        memset(GetHistoArgb(all_argb, 1, 0), 0,
+               HISTO_SIZE * kNumPredModes * num_completed *
+                   sizeof(*all_argb));
+      }
+      WebPMonitorLock(mt->monitor);
+      mt->produced[mt_seq % PRED_ANALYSIS_NUM_SLOTS] = 0;
+      mt->consumed = ++mt_seq;
+      WebPMonitorBroadcast(mt->monitor);
+      WebPMonitorUnlock(mt->monitor);
+    } else
+#endif
+    {
+      memset(all_argb, 0,
+             HISTO_SIZE * kNumPredModes * (num_completed + 1) *
+                 sizeof(*all_argb));
+    }
+
+    TileTraversalNext(&trav);
+    if (trav.tile_x == 0 &&
         !WebPReportProgress(
-            pic, percent_start + percent_range * tile_y / tiles_per_col,
+            pic, percent_start + percent_range * trav.tile_y / tiles_per_col,
             percent)) {
+#ifdef WEBP_USE_THREAD
+      if (mt != NULL) {
+        WebPMonitorLock(mt->monitor);
+        mt->abort = 1;
+        WebPMonitorBroadcast(mt->monitor);
+        WebPMonitorUnlock(mt->monitor);
+        PredAnalysisEnd(mt);
+        WebPSafeFree(mt);
+      }
+#endif
       WebPSafeFree(raw_data);
       return;
     }
   }
+
+#ifdef WEBP_USE_THREAD
+  if (mt != NULL) {
+    PredAnalysisEnd(mt);
+    WebPSafeFree(mt);
+  }
+#endif
 
   // Figure out the best sampling.
   best_cost = WEBP_INT64_MAX;
@@ -791,9 +1080,9 @@ int VP8LResidualImage(int width, int height, int min_bits, int max_bits,
                       int low_effort, uint32_t* const argb,
                       uint32_t* const argb_scratch, uint32_t* const image,
                       int near_lossless_quality, int exact,
-                      int used_subtract_green, const WebPPicture* const pic,
-                      int percent_range, int* const percent,
-                      int* const best_bits) {
+                      int used_subtract_green, int use_threads,
+                      const WebPPicture* const pic, int percent_range,
+                      int* const percent, int* const best_bits) {
   int percent_start = *percent;
   const int max_quantization = 1 << VP8LNearLosslessBits(near_lossless_quality);
   if (low_effort) {
@@ -827,7 +1116,7 @@ int VP8LResidualImage(int width, int height, int min_bits, int max_bits,
     // Find the best sampling.
     GetBestPredictorsAndSubSampling(
         width, height, min_bits, max_bits, argb_scratch, argb, max_quantization,
-        exact, used_subtract_green, pic, percent_range, percent,
+        exact, used_subtract_green, use_threads, pic, percent_range, percent,
         &modes[min_bits], best_bits, &best_mode);
     if (*best_bits == 0) {
       WebPSafeFree(modes_raw);
