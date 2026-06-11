@@ -42,9 +42,15 @@ typedef struct {
   // Index of the unique value of a histogram if any, VP8L_NON_TRIVIAL_SYM
   // otherwise.
   uint16_t trivial_symbol[5];
+  // Like trivial_symbol but kept exact when histograms are combined (the
+  // latter can stay at VP8L_NON_TRIVIAL_SYM when merging with an unused
+  // histogram). Only used to lower-bound combine costs.
+  uint16_t single_symbol[5];
   uint64_t bit_cost;  // Cached value of total bit cost.
   // Cached values of entropy costs: literal, red, blue, alpha, distance
   uint64_t costs[5];
+  // Cached sums of the populations, to lower-bound combine costs.
+  uint32_t sums[5];
   uint8_t is_used[5];  // 5 for literal, red, blue, alpha, distance
   uint16_t bin_id;     // entropy bin index.
 } VP8LHistogram;

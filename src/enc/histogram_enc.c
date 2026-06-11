@@ -312,7 +312,8 @@ static uint64_t FinalHuffmanCost(const VP8LStreaks* const stats) {
 // Set 'trivial_sym', if there's only one symbol present in the distribution.
 static uint64_t PopulationCost(const uint32_t* const population, int length,
                                uint16_t* const trivial_sym,
-                               uint8_t* const is_used) {
+                               uint8_t* const is_used,
+                               uint32_t* const sum) {
   VP8LBitEntropy bit_entropy;
   VP8LStreaks stats;
   VP8LGetEntropyUnrefined(population, length, &bit_entropy, &stats);
@@ -323,6 +324,9 @@ static uint64_t PopulationCost(const uint32_t* const population, int length,
   if (is_used != NULL) {
     // The histogram is used if there is at least one non-zero streak.
     *is_used = (stats.streaks[1][0] != 0 || stats.streaks[1][1] != 0);
+  }
+  if (sum != NULL) {
+    *sum = bit_entropy.sum;
   }
 
   return BitsEntropyRefine(&bit_entropy) + FinalHuffmanCost(&stats);
@@ -394,7 +398,7 @@ uint64_t VP8LHistogramEstimateBits(const VP8LHistogram* const h) {
     const uint32_t* population;
     GetPopulationInfo(h, (HistogramIndex)i, &population, &length);
     cost += PopulationCost(population, length, /*trivial_sym=*/NULL,
-                           /*is_used=*/NULL);
+                           /*is_used=*/NULL, /*sum=*/NULL);
   }
   cost += ((uint64_t)(VP8LExtraCost(h->literal + NUM_LITERAL_CODES,
                                     NUM_LENGTH_CODES) +
@@ -415,6 +419,34 @@ static WEBP_INLINE void SaturateAdd(uint64_t a, int64_t* b) {
   }
 }
 
+// Returns a lower bound of the cost that GetCombinedEntropy() will return for
+// the 'index' arrays of 'a' and 'b', cheaply (without scanning the arrays).
+static WEBP_INLINE uint64_t GetCombinedEntropyLowerBound(
+    const VP8LHistogram* const a, const VP8LHistogram* const b,
+    HistogramIndex index) {
+  const int is_trivial = a->trivial_symbol[index] != VP8L_NON_TRIVIAL_SYM &&
+                         a->trivial_symbol[index] == b->trivial_symbol[index];
+
+  if (is_trivial || !a->is_used[index] || !b->is_used[index]) {
+    // Exact: GetCombinedEntropy() returns the cached cost without a scan.
+    return a->is_used[index] ? a->costs[index] : b->costs[index];
+  }
+  if (a->single_symbol[index] != VP8L_NON_TRIVIAL_SYM &&
+      a->single_symbol[index] == b->single_symbol[index]) {
+    // The combined histogram could have a single non-zero value, for which
+    // BitsEntropyRefine() returns 0.
+    return InitialHuffmanCost();
+  }
+  // The combined histogram has at least two non-zero values, so
+  // BitsEntropyRefine() returns at least 627/1000 of 'min_limit', which is at
+  // least the sum of the populations. FinalHuffmanCost() is at least
+  // InitialHuffmanCost().
+  return 627 * (((uint64_t)a->sums[index] + b->sums[index])
+                << LOG_2_PRECISION_BITS) /
+             1000 +
+         InitialHuffmanCost();
+}
+
 // Returns 1 if the cost of the combined histogram is less than the threshold.
 // Otherwise returns 0 and the cost is invalid due to early bail-out.
 WEBP_NODISCARD static int GetCombinedHistogramEntropy(
@@ -422,13 +454,24 @@ WEBP_NODISCARD static int GetCombinedHistogramEntropy(
     int64_t cost_threshold_in, uint64_t* cost, uint64_t costs[5]) {
   int i;
   const uint64_t cost_threshold = (uint64_t)cost_threshold_in;
+  uint64_t lower_bounds[5];
+  uint64_t remaining_bound = 0;
   assert(a->palette_code_bits == b->palette_code_bits);
   if (cost_threshold_in <= 0) return 0;
-  *cost = 0;
 
+  for (i = 0; i < 5; ++i) {
+    lower_bounds[i] = GetCombinedEntropyLowerBound(a, b, (HistogramIndex)i);
+    remaining_bound += lower_bounds[i];
+  }
+
+  *cost = 0;
   // No need to add the extra cost for length and distance as it is a constant
   // that does not influence the histograms.
   for (i = 0; i < 5; ++i) {
+    // Bail out if the cost so far plus a lower bound of the remaining cost
+    // already reaches the threshold: the exact cost cannot be below it.
+    if (*cost + remaining_bound >= cost_threshold) return 0;
+    remaining_bound -= lower_bounds[i];
     costs[i] = GetCombinedEntropy(a, b, (HistogramIndex)i);
     *cost += costs[i];
     if (*cost >= cost_threshold) return 0;
@@ -478,6 +521,14 @@ static WEBP_INLINE void HistogramAdd(const VP8LHistogram* const h1,
     hout->trivial_symbol[i] = h1->trivial_symbol[i] == h2->trivial_symbol[i]
                                   ? h1->trivial_symbol[i]
                                   : VP8L_NON_TRIVIAL_SYM;
+    // Contrary to trivial_symbol, single_symbol stays exact when one of the
+    // histograms is unused.
+    hout->single_symbol[i] =
+        !h1->is_used[i] ? h2->single_symbol[i]
+        : !h2->is_used[i] || h1->single_symbol[i] == h2->single_symbol[i]
+            ? h1->single_symbol[i]
+            : VP8L_NON_TRIVIAL_SYM;
+    hout->sums[i] = h1->sums[i] + h2->sums[i];
     hout->is_used[i] = h1->is_used[i] || h2->is_used[i];
   }
 }
@@ -576,7 +627,8 @@ static void ComputeHistogramCost(VP8LHistogram* const h) {
     int length;
     GetPopulationInfo(h, i, &population, &length);
     h->costs[i] = PopulationCost(population, length, &h->trivial_symbol[i],
-                                 &h->is_used[i]);
+                                 &h->is_used[i], &h->sums[i]);
+    h->single_symbol[i] = h->trivial_symbol[i];
   }
   h->bit_cost = h->costs[LITERAL] + h->costs[RED] + h->costs[BLUE] +
                 h->costs[ALPHA] + h->costs[DISTANCE];
