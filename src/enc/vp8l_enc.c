@@ -1115,8 +1115,9 @@ static int ApplyCrossColorFilter(VP8LEncoder* const enc, int width, int height,
   const int min_bits = enc->cross_color_transform_bits;
 
   if (!VP8LColorSpaceTransform(width, height, min_bits, quality, enc->argb,
-                               enc->transform_data, enc->pic, percent_range / 2,
-                               percent, best_bits)) {
+                               enc->transform_data,
+                               enc->config->thread_level > 0, enc->pic,
+                               percent_range / 2, percent, best_bits)) {
     return 0;
   }
   VP8LPutBits(bw, TRANSFORM_PRESENT, 1);

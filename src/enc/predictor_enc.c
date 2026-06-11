@@ -1344,59 +1344,333 @@ static void CopyTileWithColorTransform(int xsize, int ysize, int tile_x,
   }
 }
 
+// The accumulated red/blue histograms guiding the multiplier search advance
+// in phases of CROSS_COLOR_PHASE_ROWS tile rows: the tiles of a phase are
+// evaluated against the histograms accumulated over the previous phases, and
+// the contributions of the phase are merged at the phase boundary. The merge
+// sums are integers, so they do not depend on the order in which the tiles
+// were processed and the multi-threaded loop below is bit-exact with the
+// single-threaded one.
+#define CROSS_COLOR_PHASE_ROWS 4
+
+typedef struct {
+  int width, height, bits, quality;
+  uint32_t* argb;
+  uint32_t* image;
+  int tile_xsize, tile_ysize;
+  // Snapshot of the accumulated histograms (read-only within a phase).
+  uint32_t accumulated_red_histo[256];
+  uint32_t accumulated_blue_histo[256];
+} CrossColorCtx;
+
+// Processes one tile: finds the best multipliers (using the phase snapshot
+// and the left/above neighbor multipliers), stores them, transforms the tile
+// pixels and gathers the histogram contributions into 'delta_red'/'delta_blue'
+// ('prev_x' is the left neighbor's multipliers, updated to the current ones).
+static void CrossColorProcessTile(const CrossColorCtx* const ctx, int tile_x,
+                                  int tile_y, VP8LMultipliers* const prev_x,
+                                  uint32_t delta_red[256],
+                                  uint32_t delta_blue[256]) {
+  const int width = ctx->width;
+  const int max_tile_size = 1 << ctx->bits;
+  const int tile_x_offset = tile_x * max_tile_size;
+  const int tile_y_offset = tile_y * max_tile_size;
+  const int all_x_max = GetMin(tile_x_offset + max_tile_size, width);
+  const int all_y_max = GetMin(tile_y_offset + max_tile_size, ctx->height);
+  const int offset = tile_y * ctx->tile_xsize + tile_x;
+  uint32_t* const argb = ctx->argb;
+  VP8LMultipliers prev_y;
+  int y;
+  MultipliersClear(&prev_y);
+  if (tile_y != 0) {
+    ColorCodeToMultipliers(ctx->image[offset - ctx->tile_xsize], &prev_y);
+  }
+  *prev_x = GetBestColorTransformForTile(
+      tile_x, tile_y, ctx->bits, *prev_x, prev_y, ctx->quality, width,
+      ctx->height, ctx->accumulated_red_histo, ctx->accumulated_blue_histo,
+      argb);
+  ctx->image[offset] = MultipliersToColorCode(prev_x);
+  CopyTileWithColorTransform(width, ctx->height, tile_x_offset, tile_y_offset,
+                             max_tile_size, *prev_x, argb);
+
+  // Gather the histogram contributions of the (transformed) tile.
+  for (y = tile_y_offset; y < all_y_max; ++y) {
+    int ix = y * width + tile_x_offset;
+    const int ix_end = ix + all_x_max - tile_x_offset;
+    for (; ix < ix_end; ++ix) {
+      const uint32_t pix = argb[ix];
+      if (ix >= 2 && pix == argb[ix - 2] && pix == argb[ix - 1]) {
+        continue;  // repeated pixels are handled by backward references
+      }
+      if (ix >= width + 2 && argb[ix - 2] == argb[ix - width - 2] &&
+          argb[ix - 1] == argb[ix - width - 1] && pix == argb[ix - width]) {
+        continue;  // repeated pixels are handled by backward references
+      }
+      ++delta_red[(pix >> 16) & 0xff];
+      ++delta_blue[(pix >> 0) & 0xff];
+    }
+  }
+}
+
+#ifdef WEBP_USE_THREAD
+
+// Multi-threaded cross-color analysis: within a phase, the tile rows are
+// processed by several workers in a wavefront pattern (a tile needs the
+// multipliers of its left and above neighbors, and the transformed pixels of
+// the row above one column ahead). Each worker accumulates its histogram
+// contributions privately; they are merged at the phase boundary.
+
+#define CROSS_COLOR_MAX_THREADS 8
+#define CROSS_COLOR_SYNC_RANGE 8  // publish progress every that many tiles
+
+typedef struct CrossColorMTCtx CrossColorMTCtx;
+
+typedef struct {
+  CrossColorMTCtx* ctx;
+  uint32_t delta_red[256];
+  uint32_t delta_blue[256];
+} CrossColorWorker;
+
+struct CrossColorMTCtx {
+  CrossColorCtx* base;
+  void* monitor;
+  int* row_progress;  // per tile row, number of processed tiles
+  int next_row;       // next row to be claimed
+  int phase_end;      // rows in [0, phase_end) can be processed
+  int rows_done;      // fully processed rows
+  int abort;
+  int num_workers;
+  CrossColorWorker workers[CROSS_COLOR_MAX_THREADS];
+  WebPWorker threads[CROSS_COLOR_MAX_THREADS - 1];
+};
+
+// Returns 0 if the processing was aborted.
+static int CrossColorProcessRow(CrossColorWorker* const w, int tile_y) {
+  CrossColorMTCtx* const ctx = w->ctx;
+  const int tile_xsize = ctx->base->tile_xsize;
+  VP8LMultipliers prev_x;
+  int tile_x;
+  MultipliersClear(&prev_x);
+  for (tile_x = 0; tile_x < tile_xsize; ++tile_x) {
+    if (tile_y > 0) {  // wait for the wavefront dependency
+      const int needed = tile_x + 1;
+      int aborted;
+      WebPMonitorLock(ctx->monitor);
+      while (!ctx->abort && ctx->row_progress[tile_y - 1] < needed) {
+        WebPMonitorWait(ctx->monitor);
+      }
+      aborted = ctx->abort;
+      WebPMonitorUnlock(ctx->monitor);
+      if (aborted) return 0;
+    }
+    CrossColorProcessTile(ctx->base, tile_x, tile_y, &prev_x, w->delta_red,
+                          w->delta_blue);
+    if ((tile_x + 1) % CROSS_COLOR_SYNC_RANGE == 0 ||
+        (tile_x + 1) == tile_xsize) {
+      WebPMonitorLock(ctx->monitor);
+      ctx->row_progress[tile_y] = tile_x + 1;
+      if ((tile_x + 1) == tile_xsize) ++ctx->rows_done;
+      WebPMonitorBroadcast(ctx->monitor);
+      WebPMonitorUnlock(ctx->monitor);
+    }
+  }
+  return 1;
+}
+
+static void CrossColorWorkLoop(CrossColorWorker* const w) {
+  CrossColorMTCtx* const ctx = w->ctx;
+  const int tile_ysize = ctx->base->tile_ysize;
+  while (1) {
+    int tile_y = -1;
+    WebPMonitorLock(ctx->monitor);
+    while (!ctx->abort && ctx->next_row >= ctx->phase_end &&
+           ctx->phase_end < tile_ysize) {
+      WebPMonitorWait(ctx->monitor);  // wait for the next phase
+    }
+    if (!ctx->abort && ctx->next_row < ctx->phase_end) {
+      tile_y = ctx->next_row++;
+    }
+    WebPMonitorUnlock(ctx->monitor);
+    if (tile_y < 0) break;  // aborted or no more rows
+    if (!CrossColorProcessRow(w, tile_y)) break;
+  }
+  return;
+}
+
+static int CrossColorWorkerHook(void* arg1, void* arg2) {
+  (void)arg2;
+  CrossColorWorkLoop((CrossColorWorker*)arg1);
+  return 1;
+}
+
+// Returns 1 on success, 0 on set-up failure (the caller then uses the
+// single-threaded code).
+static int CrossColorMT(CrossColorCtx* const base, const WebPPicture* const pic,
+                        int percent_range, int* const percent,
+                        int* const ok) {
+  const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
+  const int tile_ysize = base->tile_ysize;
+  int percent_start = *percent;
+  CrossColorMTCtx* ctx = NULL;
+  int rows_replayed = 0;
+  int i, s;
+
+  *ok = 1;
+  ctx = (CrossColorMTCtx*)WebPSafeCalloc(1ULL, sizeof(*ctx));
+  if (ctx == NULL) return 0;
+  ctx->base = base;
+  ctx->monitor = WebPMonitorNew();
+  ctx->row_progress = (int*)WebPSafeCalloc(tile_ysize, sizeof(int));
+  ctx->num_workers = CROSS_COLOR_MAX_THREADS;
+  if (ctx->num_workers > (tile_ysize + 1) / 2) {
+    ctx->num_workers = (tile_ysize + 1) / 2;
+  }
+  if (ctx->monitor == NULL || ctx->row_progress == NULL) goto Error;
+  for (i = 0; i < ctx->num_workers; ++i) {
+    ctx->workers[i].ctx = ctx;
+  }
+  for (i = 1; i < ctx->num_workers; ++i) {
+    WebPWorker* const thread = &ctx->threads[i - 1];
+    winterface->Init(thread);
+    thread->data1 = &ctx->workers[i];
+    thread->data2 = NULL;
+    thread->hook = CrossColorWorkerHook;
+    if (!winterface->Reset(thread)) {
+      ctx->num_workers = i;  // only End() the threads reset so far
+      goto Error;
+    }
+  }
+
+  ctx->phase_end = (CROSS_COLOR_PHASE_ROWS < tile_ysize)
+                       ? CROSS_COLOR_PHASE_ROWS
+                       : tile_ysize;
+  for (i = 1; i < ctx->num_workers; ++i) {
+    winterface->Launch(&ctx->threads[i - 1]);
+  }
+  while (1) {
+    int tile_y = -1;
+    WebPMonitorLock(ctx->monitor);
+    while (!ctx->abort && ctx->next_row >= ctx->phase_end &&
+           ctx->rows_done < ctx->phase_end) {
+      WebPMonitorWait(ctx->monitor);  // wait for the phase to drain
+    }
+    if (!ctx->abort && ctx->next_row < ctx->phase_end) {
+      tile_y = ctx->next_row++;
+    }
+    WebPMonitorUnlock(ctx->monitor);
+    if (ctx->abort) break;
+    if (tile_y >= 0) {  // the calling thread processes rows too
+      CrossColorProcessRow(&ctx->workers[0], tile_y);
+      continue;
+    }
+    // The phase is complete: merge the contributions into the snapshot.
+    // The sums are integers: the merge order does not matter.
+    for (i = 0; i < ctx->num_workers; ++i) {
+      CrossColorWorker* const w = &ctx->workers[i];
+      for (s = 0; s < 256; ++s) {
+        base->accumulated_red_histo[s] += w->delta_red[s];
+        base->accumulated_blue_histo[s] += w->delta_blue[s];
+      }
+      memset(w->delta_red, 0, sizeof(w->delta_red));
+      memset(w->delta_blue, 0, sizeof(w->delta_blue));
+    }
+    rows_replayed = ctx->phase_end;
+    if (ctx->phase_end == tile_ysize) break;  // done
+    if (!WebPReportProgress(
+            pic, percent_start + percent_range * rows_replayed / tile_ysize,
+            percent)) {
+      *ok = 0;  // user abort
+      WebPMonitorLock(ctx->monitor);
+      ctx->abort = 1;
+      WebPMonitorBroadcast(ctx->monitor);
+      WebPMonitorUnlock(ctx->monitor);
+      break;
+    }
+    WebPMonitorLock(ctx->monitor);
+    ctx->phase_end += CROSS_COLOR_PHASE_ROWS;
+    if (ctx->phase_end > tile_ysize) ctx->phase_end = tile_ysize;
+    WebPMonitorBroadcast(ctx->monitor);
+    WebPMonitorUnlock(ctx->monitor);
+  }
+
+  for (i = 1; i < ctx->num_workers; ++i) {
+    winterface->Sync(&ctx->threads[i - 1]);
+    winterface->End(&ctx->threads[i - 1]);
+  }
+  WebPSafeFree(ctx->row_progress);
+  WebPMonitorDelete(ctx->monitor);
+  WebPSafeFree(ctx);
+  return 1;
+
+ Error:
+  for (i = 1; i < ctx->num_workers; ++i) winterface->End(&ctx->threads[i - 1]);
+  WebPSafeFree(ctx->row_progress);
+  WebPMonitorDelete(ctx->monitor);
+  WebPSafeFree(ctx);
+  return 0;
+}
+
+#endif  // WEBP_USE_THREAD
+
 int VP8LColorSpaceTransform(int width, int height, int bits, int quality,
                             uint32_t* const argb, uint32_t* image,
-                            const WebPPicture* const pic, int percent_range,
-                            int* const percent, int* const best_bits) {
-  const int max_tile_size = 1 << bits;
+                            int use_threads, const WebPPicture* const pic,
+                            int percent_range, int* const percent,
+                            int* const best_bits) {
   const int tile_xsize = VP8LSubSampleSize(width, bits);
   const int tile_ysize = VP8LSubSampleSize(height, bits);
   int percent_start = *percent;
-  uint32_t accumulated_red_histo[256] = {0};
-  uint32_t accumulated_blue_histo[256] = {0};
+  CrossColorCtx ctx;
   int tile_x, tile_y;
-  VP8LMultipliers prev_x, prev_y;
-  MultipliersClear(&prev_y);
-  MultipliersClear(&prev_x);
-  for (tile_y = 0; tile_y < tile_ysize; ++tile_y) {
-    for (tile_x = 0; tile_x < tile_xsize; ++tile_x) {
-      int y;
-      const int tile_x_offset = tile_x * max_tile_size;
-      const int tile_y_offset = tile_y * max_tile_size;
-      const int all_x_max = GetMin(tile_x_offset + max_tile_size, width);
-      const int all_y_max = GetMin(tile_y_offset + max_tile_size, height);
-      const int offset = tile_y * tile_xsize + tile_x;
-      if (tile_y != 0) {
-        ColorCodeToMultipliers(image[offset - tile_xsize], &prev_y);
-      }
-      prev_x = GetBestColorTransformForTile(
-          tile_x, tile_y, bits, prev_x, prev_y, quality, width, height,
-          accumulated_red_histo, accumulated_blue_histo, argb);
-      image[offset] = MultipliersToColorCode(&prev_x);
-      CopyTileWithColorTransform(width, height, tile_x_offset, tile_y_offset,
-                                 max_tile_size, prev_x, argb);
 
-      // Gather accumulated histogram data.
-      for (y = tile_y_offset; y < all_y_max; ++y) {
-        int ix = y * width + tile_x_offset;
-        const int ix_end = ix + all_x_max - tile_x_offset;
-        for (; ix < ix_end; ++ix) {
-          const uint32_t pix = argb[ix];
-          if (ix >= 2 && pix == argb[ix - 2] && pix == argb[ix - 1]) {
-            continue;  // repeated pixels are handled by backward references
-          }
-          if (ix >= width + 2 && argb[ix - 2] == argb[ix - width - 2] &&
-              argb[ix - 1] == argb[ix - width - 1] && pix == argb[ix - width]) {
-            continue;  // repeated pixels are handled by backward references
-          }
-          ++accumulated_red_histo[(pix >> 16) & 0xff];
-          ++accumulated_blue_histo[(pix >> 0) & 0xff];
-        }
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.width = width;
+  ctx.height = height;
+  ctx.bits = bits;
+  ctx.quality = quality;
+  ctx.argb = argb;
+  ctx.image = image;
+  ctx.tile_xsize = tile_xsize;
+  ctx.tile_ysize = tile_ysize;
+
+#ifdef WEBP_USE_THREAD
+  if (use_threads && tile_ysize >= 2 * CROSS_COLOR_PHASE_ROWS &&
+      tile_xsize * tile_ysize >= 128) {
+    int ok;
+    if (CrossColorMT(&ctx, pic, percent_range, percent, &ok)) {
+      if (!ok) return 0;
+      VP8LOptimizeSampling(image, width, height, bits, MAX_TRANSFORM_BITS,
+                           best_bits);
+      return 1;
+    }
+    // Multi-threading could not be set up: use the single-threaded code.
+  }
+#else
+  (void)use_threads;
+#endif
+
+  for (tile_y = 0; tile_y < tile_ysize; tile_y += CROSS_COLOR_PHASE_ROWS) {
+    const int phase_end = GetMin(tile_y + CROSS_COLOR_PHASE_ROWS, tile_ysize);
+    uint32_t delta_red[256] = {0};
+    uint32_t delta_blue[256] = {0};
+    int y;
+    for (y = tile_y; y < phase_end; ++y) {
+      VP8LMultipliers prev_x;
+      MultipliersClear(&prev_x);
+      for (tile_x = 0; tile_x < tile_xsize; ++tile_x) {
+        CrossColorProcessTile(&ctx, tile_x, y, &prev_x, delta_red, delta_blue);
       }
     }
-    if (!WebPReportProgress(pic,
-                            percent_start + percent_range * tile_y / tile_ysize,
-                            percent)) {
+    {
+      int s;
+      for (s = 0; s < 256; ++s) {
+        ctx.accumulated_red_histo[s] += delta_red[s];
+        ctx.accumulated_blue_histo[s] += delta_blue[s];
+      }
+    }
+    if (!WebPReportProgress(
+            pic, percent_start + percent_range * phase_end / tile_ysize,
+            percent)) {
       return 0;
     }
   }
