@@ -23,6 +23,7 @@
 #include "src/utils/color_cache_utils.h"
 #include "src/utils/huffman_utils.h"
 #include "src/utils/rescaler_utils.h"
+#include "src/utils/thread_utils.h"
 #include "src/webp/decode.h"
 #include "src/webp/format_constants.h"
 #include "src/webp/types.h"
@@ -94,6 +95,14 @@ struct VP8LDecoder {
 
   uint8_t* rescaler_memory;  // Working memory for rescaling work.
   WebPRescaler* rescaler;    // Common rescaler for all channels.
+
+  // Multi-threading: when 'use_threads' is true, 'worker' applies the inverse
+  // transforms and emits the output rows of a batch while the next batch is
+  // being decoded.
+  int use_threads;
+  int worker_ok;   // true once 'worker' is initialized.
+  int worker_row;  // 'row' argument of the in-flight row-processing job.
+  WebPWorker worker;
 };
 
 //------------------------------------------------------------------------------

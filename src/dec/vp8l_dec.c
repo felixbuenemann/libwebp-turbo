@@ -868,13 +868,10 @@ static void ApplyInverseTransforms(VP8LDecoder* const dec, int start_row,
   }
 }
 
-// Processes (transforms, scales & color-converts) the rows decoded after the
-// last call.
-static void ProcessRows(VP8LDecoder* const dec, int row,
-                        int wait_for_biggest_batch) {
-  const uint32_t* const rows = dec->pixels + dec->width * dec->last_row;
-  int num_rows;
-
+// Returns whether the rows decoded so far should be transformed and emitted
+// now (true) or accumulated further (false).
+static int ShouldProcessRows(const VP8LDecoder* const dec, int row,
+                             int wait_for_biggest_batch) {
   // In case of YUV conversion and if we do not need to get to the last row.
   if (wait_for_biggest_batch) {
     // In case of YUV conversion, and if we do not use the whole cropping
@@ -882,17 +879,23 @@ static void ProcessRows(VP8LDecoder* const dec, int row,
     if (!WebPIsRGBMode(dec->output->colorspace) && row >= dec->io->crop_top &&
         row < dec->io->crop_bottom) {
       // Make sure the number of rows to process is even.
-      if ((row - dec->io->crop_top) % 2 != 0) return;
+      if ((row - dec->io->crop_top) % 2 != 0) return 0;
       // Make sure the cache is as full as possible.
       if (row % NUM_ARGB_CACHE_ROWS != 0 &&
           (row + 1) % NUM_ARGB_CACHE_ROWS != 0) {
-        return;
+        return 0;
       }
     } else {
-      if (row % NUM_ARGB_CACHE_ROWS != 0) return;
+      if (row % NUM_ARGB_CACHE_ROWS != 0) return 0;
     }
   }
-  num_rows = row - dec->last_row;
+  return 1;
+}
+
+// Transforms, scales & color-converts the rows decoded after the last call.
+static void ProcessRowsImpl(VP8LDecoder* const dec, int row) {
+  const uint32_t* const rows = dec->pixels + dec->width * dec->last_row;
+  const int num_rows = row - dec->last_row;
   assert(row <= dec->io->crop_bottom);
   // We can't process more than NUM_ARGB_CACHE_ROWS at a time (that's the size
   // of argb_cache), but we currently don't need more than that.
@@ -934,6 +937,37 @@ static void ProcessRows(VP8LDecoder* const dec, int row,
   // Update 'last_row'.
   dec->last_row = row;
   assert(dec->last_row <= dec->height);
+}
+
+// Processes (transforms, scales & color-converts) the rows decoded after the
+// last call.
+static void ProcessRows(VP8LDecoder* const dec, int row,
+                        int wait_for_biggest_batch) {
+  if (!ShouldProcessRows(dec, row, wait_for_biggest_batch)) return;
+  ProcessRowsImpl(dec, row);
+}
+
+static int ProcessRowsHook(void* arg1, void* arg2) {
+  VP8LDecoder* const dec = (VP8LDecoder*)arg1;
+  (void)arg2;
+  ProcessRowsImpl(dec, dec->worker_row);
+  return 1;
+}
+
+// Multi-threaded version of ProcessRows(): hands the batch over to 'worker'
+// so that the inverse transforms and the color conversion of a batch overlap
+// with the decoding of the next one. The worker only touches the row-output
+// state (argb_cache, rescaler, output buffer, last_row...) and reads pixel
+// rows that are fully decoded and never written to again; the decoding loop
+// does not touch any of these, making the output the same as with
+// ProcessRows().
+static void ProcessRowsMT(VP8LDecoder* const dec, int row,
+                          int wait_for_biggest_batch) {
+  const WebPWorkerInterface* const worker_interface = WebPGetWorkerInterface();
+  if (!ShouldProcessRows(dec, row, wait_for_biggest_batch)) return;
+  worker_interface->Sync(&dec->worker);  // wait for the previous batch
+  dec->worker_row = row;
+  worker_interface->Launch(&dec->worker);
 }
 
 // Row-processing for the special case when alpha data contains only one
@@ -1505,6 +1539,15 @@ VP8LDecoder* VP8LNew(void) {
 static void VP8LClear(VP8LDecoder* const dec) {
   int i;
   if (dec == NULL) return;
+  if (dec->worker_ok) {
+    const WebPWorkerInterface* const worker_interface =
+        WebPGetWorkerInterface();
+    // Make sure no row-processing job references the buffers freed below.
+    worker_interface->Sync(&dec->worker);
+    worker_interface->End(&dec->worker);
+    dec->worker_ok = 0;
+    dec->use_threads = 0;
+  }
   ClearMetadata(&dec->hdr);
 
   WebPSafeFree(dec->pixels);
@@ -1865,13 +1908,35 @@ int VP8LDecodeImage(VP8LDecoder* const dec) {
         }
       }
     }
+
+    // Process the rows on a worker thread, except in incremental mode whose
+    // row batches are irregular and tied to the save/restore states.
+    dec->use_threads = (params->options != NULL &&
+                        params->options->use_threads && !dec->incremental);
+    if (dec->use_threads) {
+      const WebPWorkerInterface* const worker_interface =
+          WebPGetWorkerInterface();
+      worker_interface->Init(&dec->worker);
+      dec->worker.data1 = dec;
+      dec->worker.data2 = NULL;
+      dec->worker.hook = ProcessRowsHook;
+      if (worker_interface->Reset(&dec->worker)) {
+        dec->worker_ok = 1;
+      } else {
+        dec->use_threads = 0;  // fall back to synchronous processing
+      }
+    }
     dec->state = READ_DATA;
   }
 
   // Decode.
   if (!DecodeImageData(dec, dec->pixels, dec->width, dec->height,
-                       io->crop_bottom, ProcessRows)) {
+                       io->crop_bottom,
+                       dec->use_threads ? ProcessRowsMT : ProcessRows)) {
     goto Err;
+  }
+  if (dec->use_threads) {
+    WebPGetWorkerInterface()->Sync(&dec->worker);  // finish the last batch
   }
 
   params->last_y = dec->last_out_row;
