@@ -19,6 +19,7 @@
 
 #include "src/dsp/lossless.h"
 #include "src/dsp/neon.h"
+#include "src/webp/format_constants.h"
 
 //------------------------------------------------------------------------------
 // Subtract-Green Transform
@@ -240,8 +241,223 @@ static void CollectColorRedTransforms_NEON(const uint32_t* WEBP_RESTRICT argb,
   }
 }
 
+static void CollectArgbHistos_NEON(const uint32_t* WEBP_RESTRICT argb,
+                                   int num_pixels, uint32_t histo[4 * 256]) {
+  int i;
+  for (i = 0; i + SPAN <= num_pixels; i += SPAN) {
+    // De-interleave the channels of 8 pixels: val[0] = blue, ..., val[3] =
+    // alpha (little-endian).
+    const uint8x8x4_t v = vld4_u8((const uint8_t*)(argb + i));
+    AccumulateHisto_NEON(vget_lane_u64(vreinterpret_u64_u8(v.val[3]), 0),
+                         histo + 0 * 256);
+    AccumulateHisto_NEON(vget_lane_u64(vreinterpret_u64_u8(v.val[2]), 0),
+                         histo + 1 * 256);
+    AccumulateHisto_NEON(vget_lane_u64(vreinterpret_u64_u8(v.val[1]), 0),
+                         histo + 2 * 256);
+    AccumulateHisto_NEON(vget_lane_u64(vreinterpret_u64_u8(v.val[0]), 0),
+                         histo + 3 * 256);
+  }
+  for (; i < num_pixels; ++i) {
+    const uint32_t pix = argb[i];
+    ++histo[0 * 256 + (pix >> 24)];
+    ++histo[1 * 256 + ((pix >> 16) & 0xff)];
+    ++histo[2 * 256 + ((pix >> 8) & 0xff)];
+    ++histo[3 * 256 + (pix & 0xff)];
+  }
+}
+
 #undef SPAN
 #undef CST_5b
+
+//------------------------------------------------------------------------------
+// Predictor Transform
+
+// Average of two packed pixels, per byte: floor((a + b) / 2).
+static WEBP_INLINE uint8x16_t Average2_NEON(const uint8x16_t a,
+                                            const uint8x16_t b) {
+  return vhaddq_u8(a, b);
+}
+
+// Predictor0: ARGB_BLACK.
+static void PredictorSub0_NEON(const uint32_t* in, const uint32_t* upper,
+                               int num_pixels, uint32_t* WEBP_RESTRICT out) {
+  int i;
+  const uint8x16_t black = vreinterpretq_u8_u32(vdupq_n_u32(ARGB_BLACK));
+  for (i = 0; i + 4 <= num_pixels; i += 4) {
+    const uint8x16_t src = vreinterpretq_u8_u32(vld1q_u32(&in[i]));
+    vst1q_u32(&out[i], vreinterpretq_u32_u8(vsubq_u8(src, black)));
+  }
+  if (i != num_pixels) {
+    VP8LPredictorsSub_C[0](in + i, NULL, num_pixels - i, out + i);
+  }
+  (void)upper;
+}
+
+#define GENERATE_PREDICTOR_1(X, IN)                                          \
+  static void PredictorSub##X##_NEON(                                        \
+      const uint32_t* const in, const uint32_t* const upper, int num_pixels, \
+      uint32_t* WEBP_RESTRICT const out) {                                   \
+    int i;                                                                   \
+    for (i = 0; i + 4 <= num_pixels; i += 4) {                               \
+      const uint8x16_t src = vreinterpretq_u8_u32(vld1q_u32(&in[i]));        \
+      const uint8x16_t pred = vreinterpretq_u8_u32(vld1q_u32(&(IN)));        \
+      vst1q_u32(&out[i], vreinterpretq_u32_u8(vsubq_u8(src, pred)));         \
+    }                                                                        \
+    if (i != num_pixels) {                                                   \
+      VP8LPredictorsSub_C[(X)](in + i, WEBP_OFFSET_PTR(upper, i),            \
+                               num_pixels - i, out + i);                     \
+    }                                                                        \
+  }
+
+GENERATE_PREDICTOR_1(1, in[i - 1])     // Predictor1: L
+GENERATE_PREDICTOR_1(2, upper[i])      // Predictor2: T
+GENERATE_PREDICTOR_1(3, upper[i + 1])  // Predictor3: TR
+GENERATE_PREDICTOR_1(4, upper[i - 1])  // Predictor4: TL
+#undef GENERATE_PREDICTOR_1
+
+// Predictor5: avg2(avg2(L, TR), T)
+static void PredictorSub5_NEON(const uint32_t* in, const uint32_t* upper,
+                               int num_pixels, uint32_t* WEBP_RESTRICT out) {
+  int i;
+  for (i = 0; i + 4 <= num_pixels; i += 4) {
+    const uint8x16_t L = vreinterpretq_u8_u32(vld1q_u32(&in[i - 1]));
+    const uint8x16_t T = vreinterpretq_u8_u32(vld1q_u32(&upper[i]));
+    const uint8x16_t TR = vreinterpretq_u8_u32(vld1q_u32(&upper[i + 1]));
+    const uint8x16_t src = vreinterpretq_u8_u32(vld1q_u32(&in[i]));
+    const uint8x16_t pred = Average2_NEON(Average2_NEON(L, TR), T);
+    vst1q_u32(&out[i], vreinterpretq_u32_u8(vsubq_u8(src, pred)));
+  }
+  if (i != num_pixels) {
+    VP8LPredictorsSub_C[5](in + i, upper + i, num_pixels - i, out + i);
+  }
+}
+
+#define GENERATE_PREDICTOR_2(X, A, B)                                       \
+  static void PredictorSub##X##_NEON(const uint32_t* in,                    \
+                                     const uint32_t* upper, int num_pixels, \
+                                     uint32_t* WEBP_RESTRICT out) {         \
+    int i;                                                                  \
+    for (i = 0; i + 4 <= num_pixels; i += 4) {                              \
+      const uint8x16_t tA = vreinterpretq_u8_u32(vld1q_u32(&(A)));          \
+      const uint8x16_t tB = vreinterpretq_u8_u32(vld1q_u32(&(B)));          \
+      const uint8x16_t src = vreinterpretq_u8_u32(vld1q_u32(&in[i]));       \
+      const uint8x16_t pred = Average2_NEON(tA, tB);                        \
+      vst1q_u32(&out[i], vreinterpretq_u32_u8(vsubq_u8(src, pred)));        \
+    }                                                                       \
+    if (i != num_pixels) {                                                  \
+      VP8LPredictorsSub_C[(X)](in + i, upper + i, num_pixels - i, out + i); \
+    }                                                                       \
+  }
+
+GENERATE_PREDICTOR_2(6, in[i - 1], upper[i - 1])  // Predictor6: avg(L, TL)
+GENERATE_PREDICTOR_2(7, in[i - 1], upper[i])      // Predictor7: avg(L, T)
+GENERATE_PREDICTOR_2(8, upper[i - 1], upper[i])   // Predictor8: avg(TL, T)
+GENERATE_PREDICTOR_2(9, upper[i], upper[i + 1])   // Predictor9: average(T, TR)
+#undef GENERATE_PREDICTOR_2
+
+// Predictor10: avg(avg(L, TL), avg(T, TR)).
+static void PredictorSub10_NEON(const uint32_t* in, const uint32_t* upper,
+                                int num_pixels, uint32_t* WEBP_RESTRICT out) {
+  int i;
+  for (i = 0; i + 4 <= num_pixels; i += 4) {
+    const uint8x16_t L = vreinterpretq_u8_u32(vld1q_u32(&in[i - 1]));
+    const uint8x16_t TL = vreinterpretq_u8_u32(vld1q_u32(&upper[i - 1]));
+    const uint8x16_t T = vreinterpretq_u8_u32(vld1q_u32(&upper[i]));
+    const uint8x16_t TR = vreinterpretq_u8_u32(vld1q_u32(&upper[i + 1]));
+    const uint8x16_t src = vreinterpretq_u8_u32(vld1q_u32(&in[i]));
+    const uint8x16_t pred =
+        Average2_NEON(Average2_NEON(L, TL), Average2_NEON(T, TR));
+    vst1q_u32(&out[i], vreinterpretq_u32_u8(vsubq_u8(src, pred)));
+  }
+  if (i != num_pixels) {
+    VP8LPredictorsSub_C[10](in + i, upper + i, num_pixels - i, out + i);
+  }
+}
+
+// Predictor11: select.
+static void PredictorSub11_NEON(const uint32_t* in, const uint32_t* upper,
+                                int num_pixels, uint32_t* WEBP_RESTRICT out) {
+  int i;
+  for (i = 0; i + 4 <= num_pixels; i += 4) {
+    const uint8x16_t L = vreinterpretq_u8_u32(vld1q_u32(&in[i - 1]));
+    const uint8x16_t TL = vreinterpretq_u8_u32(vld1q_u32(&upper[i - 1]));
+    const uint8x16_t T = vreinterpretq_u8_u32(vld1q_u32(&upper[i]));
+    const uint8x16_t src = vreinterpretq_u8_u32(vld1q_u32(&in[i]));
+    // Per-pixel sums of absolute byte differences.
+    const uint32x4_t pa = vpaddlq_u16(vpaddlq_u8(vabdq_u8(T, TL)));
+    const uint32x4_t pb = vpaddlq_u16(vpaddlq_u8(vabdq_u8(L, TL)));
+    const uint32x4_t mask = vcgtq_u32(pb, pa);  // pb > pa ? L : T
+    const uint8x16_t pred = vreinterpretq_u8_u32(vbslq_u32(
+        mask, vreinterpretq_u32_u8(L), vreinterpretq_u32_u8(T)));
+    vst1q_u32(&out[i], vreinterpretq_u32_u8(vsubq_u8(src, pred)));
+  }
+  if (i != num_pixels) {
+    VP8LPredictorsSub_C[11](in + i, upper + i, num_pixels - i, out + i);
+  }
+}
+
+// Predictor12: ClampedAddSubtractFull.
+static void PredictorSub12_NEON(const uint32_t* in, const uint32_t* upper,
+                                int num_pixels, uint32_t* WEBP_RESTRICT out) {
+  int i;
+  for (i = 0; i + 4 <= num_pixels; i += 4) {
+    const uint8x16_t L = vreinterpretq_u8_u32(vld1q_u32(&in[i - 1]));
+    const uint8x16_t TL = vreinterpretq_u8_u32(vld1q_u32(&upper[i - 1]));
+    const uint8x16_t T = vreinterpretq_u8_u32(vld1q_u32(&upper[i]));
+    const uint8x16_t src = vreinterpretq_u8_u32(vld1q_u32(&in[i]));
+    // pred = clamp_to_u8(L + T - TL), computed in 16-bit.
+    const int16x8_t L_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(L)));
+    const int16x8_t L_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(L)));
+    const int16x8_t T_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(T)));
+    const int16x8_t T_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(T)));
+    const int16x8_t TL_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(TL)));
+    const int16x8_t TL_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(TL)));
+    const int16x8_t pred_lo = vaddq_s16(L_lo, vsubq_s16(T_lo, TL_lo));
+    const int16x8_t pred_hi = vaddq_s16(L_hi, vsubq_s16(T_hi, TL_hi));
+    const uint8x16_t pred =
+        vcombine_u8(vqmovun_s16(pred_lo), vqmovun_s16(pred_hi));
+    vst1q_u32(&out[i], vreinterpretq_u32_u8(vsubq_u8(src, pred)));
+  }
+  if (i != num_pixels) {
+    VP8LPredictorsSub_C[12](in + i, upper + i, num_pixels - i, out + i);
+  }
+}
+
+// Predictor13: ClampedAddSubtractHalf.
+static WEBP_INLINE int16x8_t ClampedAddSubtractHalf_NEON(const int16x8_t avg,
+                                                         const int16x8_t TL) {
+  // pred = clamp_to_u8(avg + (avg - TL) / 2), with the same rounding towards
+  // zero as the C code: (avg - TL + (TL > avg)) >> 1.
+  const int16x8_t A1 = vsubq_s16(avg, TL);
+  const int16x8_t bit_fix = vreinterpretq_s16_u16(vcgtq_s16(TL, avg));
+  const int16x8_t A2 = vsubq_s16(A1, bit_fix);
+  const int16x8_t A3 = vshrq_n_s16(A2, 1);
+  return vaddq_s16(avg, A3);
+}
+
+static void PredictorSub13_NEON(const uint32_t* in, const uint32_t* upper,
+                                int num_pixels, uint32_t* WEBP_RESTRICT out) {
+  int i;
+  for (i = 0; i + 4 <= num_pixels; i += 4) {
+    const uint8x16_t L = vreinterpretq_u8_u32(vld1q_u32(&in[i - 1]));
+    const uint8x16_t TL = vreinterpretq_u8_u32(vld1q_u32(&upper[i - 1]));
+    const uint8x16_t T = vreinterpretq_u8_u32(vld1q_u32(&upper[i]));
+    const uint8x16_t src = vreinterpretq_u8_u32(vld1q_u32(&in[i]));
+    const uint16x8_t sum_lo = vaddl_u8(vget_low_u8(L), vget_low_u8(T));
+    const uint16x8_t sum_hi = vaddl_u8(vget_high_u8(L), vget_high_u8(T));
+    const int16x8_t avg_lo = vreinterpretq_s16_u16(vshrq_n_u16(sum_lo, 1));
+    const int16x8_t avg_hi = vreinterpretq_s16_u16(vshrq_n_u16(sum_hi, 1));
+    const int16x8_t TL_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(TL)));
+    const int16x8_t TL_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(TL)));
+    const int16x8_t A4_lo = ClampedAddSubtractHalf_NEON(avg_lo, TL_lo);
+    const int16x8_t A4_hi = ClampedAddSubtractHalf_NEON(avg_hi, TL_hi);
+    const uint8x16_t pred = vcombine_u8(vqmovun_s16(A4_lo), vqmovun_s16(A4_hi));
+    vst1q_u32(&out[i], vreinterpretq_u32_u8(vsubq_u8(src, pred)));
+  }
+  if (i != num_pixels) {
+    VP8LPredictorsSub_C[13](in + i, upper + i, num_pixels - i, out + i);
+  }
+}
 
 //------------------------------------------------------------------------------
 // Entry point
@@ -253,6 +469,24 @@ WEBP_TSAN_IGNORE_FUNCTION void VP8LEncDspInitNEON(void) {
   VP8LTransformColor = TransformColor_NEON;
   VP8LCollectColorBlueTransforms = CollectColorBlueTransforms_NEON;
   VP8LCollectColorRedTransforms = CollectColorRedTransforms_NEON;
+  VP8LCollectArgbHistos = CollectArgbHistos_NEON;
+
+  VP8LPredictorsSub[0] = PredictorSub0_NEON;
+  VP8LPredictorsSub[1] = PredictorSub1_NEON;
+  VP8LPredictorsSub[2] = PredictorSub2_NEON;
+  VP8LPredictorsSub[3] = PredictorSub3_NEON;
+  VP8LPredictorsSub[4] = PredictorSub4_NEON;
+  VP8LPredictorsSub[5] = PredictorSub5_NEON;
+  VP8LPredictorsSub[6] = PredictorSub6_NEON;
+  VP8LPredictorsSub[7] = PredictorSub7_NEON;
+  VP8LPredictorsSub[8] = PredictorSub8_NEON;
+  VP8LPredictorsSub[9] = PredictorSub9_NEON;
+  VP8LPredictorsSub[10] = PredictorSub10_NEON;
+  VP8LPredictorsSub[11] = PredictorSub11_NEON;
+  VP8LPredictorsSub[12] = PredictorSub12_NEON;
+  VP8LPredictorsSub[13] = PredictorSub13_NEON;
+  VP8LPredictorsSub[14] = PredictorSub0_NEON;  // <= padding security sentinels
+  VP8LPredictorsSub[15] = PredictorSub0_NEON;
 }
 
 #else  // !WEBP_USE_NEON

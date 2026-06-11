@@ -77,14 +77,6 @@ static int64_t PredictionCostSpatialHistogram(
   return retval;
 }
 
-static WEBP_INLINE void UpdateHisto(uint32_t histo_argb[HISTO_SIZE],
-                                    uint32_t argb) {
-  ++histo_argb[0 * 256 + (argb >> 24)];
-  ++histo_argb[1 * 256 + ((argb >> 16) & 0xff)];
-  ++histo_argb[2 * 256 + ((argb >> 8) & 0xff)];
-  ++histo_argb[3 * 256 + (argb & 0xff)];
-}
-
 //------------------------------------------------------------------------------
 // Spatial transform functions.
 
@@ -251,12 +243,35 @@ static uint32_t NearLossless(uint32_t value, uint32_t predict,
 // In case of a lossy encoding, updates the source image to avoid propagating
 // the deviation further to pixels which depend on the current pixel for their
 // predictions.
+// Returns 1 if the pixels in the row segment [x_start, x_end) are all opaque.
+static int RowSegmentIsOpaque(const uint32_t* const row, int x_start,
+                              int x_end) {
+  int x;
+  for (x = x_start; x < x_end; ++x) {
+    if ((row[x] & kMaskAlpha) == 0) return 0;
+  }
+  return 1;
+}
+
+// 'segment_is_opaque' must be true only if the pixels [x_start, x_end) of
+// 'current_row' all have a non-zero alpha value.
 static WEBP_INLINE void GetResidual(
     int width, int height, uint32_t* const upper_row,
     uint32_t* const current_row, const uint8_t* const max_diffs, int mode,
     int x_start, int x_end, int y, int max_quantization, int exact,
-    int used_subtract_green, uint32_t* const out) {
-  if (exact) {
+    int used_subtract_green, int segment_is_opaque, uint32_t* const out) {
+  int use_batch = exact;
+  if (!use_batch) {
+    // On a fully opaque segment with no near-lossless quantization, the
+    // pixel-by-pixel loop below neither quantizes nor cleans up any pixel
+    // and computes the same residuals as the (vectorized) batch prediction.
+#if (WEBP_NEAR_LOSSLESS == 1)
+    use_batch = (max_quantization == 1) && segment_is_opaque;
+#else
+    use_batch = segment_is_opaque;
+#endif
+  }
+  if (use_batch) {
     PredictBatch(mode, x_start, y, x_end - x_start, current_row, upper_row,
                  out);
   } else {
@@ -404,9 +419,17 @@ static void ComputeResidualsForTile(
   int mode;
   // Need pointers to be able to swap arrays.
   uint32_t residuals[1 << MAX_TRANSFORM_BITS];
+  // Whether each row segment is fully opaque (the rows are re-read for each
+  // mode and alpha values are never modified, so compute the flags once).
+  uint8_t row_is_opaque[1 << MAX_TRANSFORM_BITS];
+  int relative_y;
   assert(max_x <= (1 << MAX_TRANSFORM_BITS));
+  assert(max_y <= (1 << MAX_TRANSFORM_BITS));
+  for (relative_y = 0; relative_y < max_y; ++relative_y) {
+    row_is_opaque[relative_y] = (uint8_t)RowSegmentIsOpaque(
+        argb + (start_y + relative_y) * width, start_x, start_x + max_x);
+  }
   for (mode = 0; mode < kNumPredModes; ++mode) {
-    int relative_y;
     uint32_t* const histo_argb =
         GetHistoArgb(all_argb, /*subsampling_index=*/0, mode);
     if (start_y > 0) {
@@ -420,7 +443,6 @@ static void ComputeResidualsForTile(
     }
     for (relative_y = 0; relative_y < max_y; ++relative_y) {
       const int y = start_y + relative_y;
-      int relative_x;
       uint32_t* tmp = upper_row;
       upper_row = current_row;
       current_row = tmp;
@@ -439,19 +461,15 @@ static void ComputeResidualsForTile(
 
       GetResidual(width, height, upper_row, current_row, max_diffs, mode,
                   start_x, start_x + max_x, y, max_quantization, exact,
-                  used_subtract_green, residuals);
-      for (relative_x = 0; relative_x < max_x; ++relative_x) {
-        UpdateHisto(histo_argb, residuals[relative_x]);
-      }
+                  used_subtract_green, row_is_opaque[relative_y], residuals);
+      VP8LCollectArgbHistos(residuals, max_x, histo_argb);
       if (update_up_to_index > 0) {
         uint32_t subsampling_index;
         for (subsampling_index = 1; subsampling_index <= update_up_to_index;
              ++subsampling_index) {
           uint32_t* const super_histo =
               GetHistoArgb(all_argb, subsampling_index, mode);
-          for (relative_x = 0; relative_x < max_x; ++relative_x) {
-            UpdateHisto(super_histo, residuals[relative_x]);
-          }
+          VP8LCollectArgbHistos(residuals, max_x, super_histo);
         }
       }
     }
@@ -513,7 +531,9 @@ static void CopyImageWithPrediction(int width, int height, int bits,
         if (x_end > width) x_end = width;
         GetResidual(width, height, upper_row, current_row, current_max_diffs,
                     mode, x, x_end, y, max_quantization, exact,
-                    used_subtract_green, argb + y * width + x);
+                    used_subtract_green,
+                    RowSegmentIsOpaque(current_row, x, x_end),
+                    argb + y * width + x);
         x = x_end;
       }
     }

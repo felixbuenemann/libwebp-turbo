@@ -169,6 +169,14 @@ typedef void (*VP8LCollectColorRedTransformsFunc)(
 extern VP8LCollectColorRedTransformsFunc VP8LCollectColorRedTransforms;
 extern VP8LCollectColorRedTransformsFunc VP8LCollectColorRedTransforms_SSE;
 
+// Adds the A/R/G/B values of 'num_pixels' pixels to the four 256-bin
+// histograms 'histo' (alpha first, blue last).
+typedef void (*VP8LCollectArgbHistosFunc)(const uint32_t* WEBP_RESTRICT argb,
+                                          int num_pixels,
+                                          uint32_t histo[4 * 256]);
+extern VP8LCollectArgbHistosFunc VP8LCollectArgbHistos;
+extern VP8LCollectArgbHistosFunc VP8LCollectArgbHistos_SSE;
+
 // Expose some C-only fallback functions
 void VP8LTransformColor_C(const VP8LMultipliers* WEBP_RESTRICT const m,
                           uint32_t* WEBP_RESTRICT data, int num_pixels);

@@ -190,6 +190,36 @@ static void CollectColorRedTransforms_SSE2(const uint32_t* WEBP_RESTRICT argb,
     }
   }
 }
+
+static void CollectArgbHistos_SSE2(const uint32_t* WEBP_RESTRICT argb,
+                                   int num_pixels, uint32_t histo[4 * 256]) {
+  const __m128i mask = _mm_set1_epi32(0xff);
+  int i;
+  for (i = 0; i + SPAN <= num_pixels; i += SPAN) {
+    const __m128i I0 = _mm_loadu_si128((const __m128i*)(argb + i));
+    const __m128i I1 = _mm_loadu_si128((const __m128i*)(argb + i + SPAN / 2));
+    // De-interleave the channels of 8 pixels as 8x16-bit values each.
+    const __m128i a =
+        _mm_packs_epi32(_mm_srli_epi32(I0, 24), _mm_srli_epi32(I1, 24));
+    const __m128i r = _mm_packs_epi32(_mm_and_si128(_mm_srli_epi32(I0, 16), mask),
+                                      _mm_and_si128(_mm_srli_epi32(I1, 16), mask));
+    const __m128i g = _mm_packs_epi32(_mm_and_si128(_mm_srli_epi32(I0, 8), mask),
+                                      _mm_and_si128(_mm_srli_epi32(I1, 8), mask));
+    const __m128i b = _mm_packs_epi32(_mm_and_si128(I0, mask),
+                                      _mm_and_si128(I1, mask));
+    AccumulateHisto8_SSE2(Pack8Values_SSE2(a), histo + 0 * 256);
+    AccumulateHisto8_SSE2(Pack8Values_SSE2(r), histo + 1 * 256);
+    AccumulateHisto8_SSE2(Pack8Values_SSE2(g), histo + 2 * 256);
+    AccumulateHisto8_SSE2(Pack8Values_SSE2(b), histo + 3 * 256);
+  }
+  for (; i < num_pixels; ++i) {
+    const uint32_t pix = argb[i];
+    ++histo[0 * 256 + (pix >> 24)];
+    ++histo[1 * 256 + ((pix >> 16) & 0xff)];
+    ++histo[2 * 256 + ((pix >> 8) & 0xff)];
+    ++histo[3 * 256 + (pix & 0xff)];
+  }
+}
 #undef SPAN
 #undef MK_CST_16
 
@@ -720,12 +750,14 @@ WEBP_TSAN_IGNORE_FUNCTION void VP8LEncDspInitSSE2(void) {
   VP8LTransformColor_SSE = TransformColor_SSE2;
   VP8LCollectColorBlueTransforms_SSE = CollectColorBlueTransforms_SSE2;
   VP8LCollectColorRedTransforms_SSE = CollectColorRedTransforms_SSE2;
+  VP8LCollectArgbHistos_SSE = CollectArgbHistos_SSE2;
   VP8LBundleColorMap_SSE = BundleColorMap_SSE2;
 
   VP8LSubtractGreenFromBlueAndRed = VP8LSubtractGreenFromBlueAndRed_SSE;
   VP8LTransformColor = VP8LTransformColor_SSE;
   VP8LCollectColorBlueTransforms = VP8LCollectColorBlueTransforms_SSE;
   VP8LCollectColorRedTransforms = VP8LCollectColorRedTransforms_SSE;
+  VP8LCollectArgbHistos = VP8LCollectArgbHistos_SSE;
   VP8LAddVector = AddVector_SSE2;
   VP8LAddVectorEq = AddVectorEq_SSE2;
 #if !defined(DONT_USE_COMBINED_SHANNON_ENTROPY_SSE2_FUNC)

@@ -534,6 +534,18 @@ void VP8LCollectColorBlueTransforms_C(const uint32_t* WEBP_RESTRICT argb,
   }
 }
 
+static void CollectArgbHistos_C(const uint32_t* WEBP_RESTRICT argb,
+                                int num_pixels, uint32_t histo[4 * 256]) {
+  int i;
+  for (i = 0; i < num_pixels; ++i) {
+    const uint32_t pix = argb[i];
+    ++histo[0 * 256 + (pix >> 24)];
+    ++histo[1 * 256 + ((pix >> 16) & 0xff)];
+    ++histo[2 * 256 + ((pix >> 8) & 0xff)];
+    ++histo[3 * 256 + (pix & 0xff)];
+  }
+}
+
 //------------------------------------------------------------------------------
 
 static int VectorMismatch_C(const uint32_t* const array1,
@@ -651,6 +663,8 @@ VP8LCollectColorBlueTransformsFunc VP8LCollectColorBlueTransforms;
 VP8LCollectColorBlueTransformsFunc VP8LCollectColorBlueTransforms_SSE;
 VP8LCollectColorRedTransformsFunc VP8LCollectColorRedTransforms;
 VP8LCollectColorRedTransformsFunc VP8LCollectColorRedTransforms_SSE;
+VP8LCollectArgbHistosFunc VP8LCollectArgbHistos;
+VP8LCollectArgbHistosFunc VP8LCollectArgbHistos_SSE;
 
 VP8LFastLog2SlowFunc VP8LFastLog2Slow;
 VP8LFastSLog2SlowFunc VP8LFastSLog2Slow;
@@ -693,6 +707,7 @@ WEBP_DSP_INIT_FUNC(VP8LEncDspInit) {
 
   VP8LCollectColorBlueTransforms = VP8LCollectColorBlueTransforms_C;
   VP8LCollectColorRedTransforms = VP8LCollectColorRedTransforms_C;
+  VP8LCollectArgbHistos = CollectArgbHistos_C;
 
   VP8LFastLog2Slow = FastLog2Slow_C;
   VP8LFastSLog2Slow = FastSLog2Slow_C;
