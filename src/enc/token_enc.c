@@ -250,33 +250,6 @@ void VP8TokenReplayStats(const VP8TBuffer* const b, proba_t* const stats) {
   }
 }
 
-// Like VP8TokenReplayStats() but accumulates the (total, count) pair of each
-// stat into full-precision separate arrays, with no overflow halving. This
-// makes a parallel split-and-sum of the per-row stats independent of how the
-// rows were distributed across threads (the halving in VP8RecordStats() is
-// order-dependent); the caller halves once when packing the merged result.
-void VP8TokenReplayStatsWide(const VP8TBuffer* const b, uint32_t* const total,
-                             uint32_t* const count) {
-  const VP8Tokens* p = b->pages;
-  assert(!b->error);
-  while (p != NULL) {
-    const VP8Tokens* const next = p->next;
-    const int N = (next == NULL) ? b->left : 0;
-    int n = b->page_size;
-    const token_t* const tokens = TOKEN_DATA(p);
-    while (n-- > N) {
-      const token_t token = tokens[n];
-      if (!(token & FIXED_PROBA_BIT)) {
-        const uint32_t raw = token & 0x3fffu;
-        const uint32_t idx = raw - ((raw % NUM_PROBAS) == 10);
-        ++total[idx];
-        count[idx] += (token >> 15) & 1;
-      }
-    }
-    p = next;
-  }
-}
-
 // Size estimation
 size_t VP8EstimateTokenSize(VP8TBuffer* const b, const uint8_t* const probas) {
   size_t size = 0;
