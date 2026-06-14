@@ -349,6 +349,11 @@ int VP8EmitTokens(VP8TBuffer* const b, VP8BitWriter* const bw,
                   const uint8_t* const probas, int final_pass);
 // Re-applies the recorded tokens of 'b' to 'stats' in recording order.
 void VP8TokenReplayStats(const VP8TBuffer* const b, proba_t* const stats);
+// Like the above but accumulates each stat's (total, count) into separate
+// full-precision arrays without overflow halving, so a parallel split-and-sum
+// over rows is independent of the row-to-thread distribution.
+void VP8TokenReplayStatsWide(const VP8TBuffer* const b, uint32_t* const total,
+                             uint32_t* const count);
 
 // record the coding of coefficients without knowing the probabilities yet
 int VP8RecordCoeffTokens(int ctx, const struct VP8Residual* const res,

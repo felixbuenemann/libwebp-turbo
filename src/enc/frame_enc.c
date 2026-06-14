@@ -938,6 +938,10 @@ typedef struct {
   // Scratch statistics, discarded: the canonical ones are rebuilt by
   // replaying the tokens. This keeps RecordTokens() off the shared state.
   StatsArray scratch_stats[NUM_TYPES][NUM_BANDS];
+  // Canonical token stats for the rows this worker processed, accumulated as it
+  // goes so the replay overlaps the wavefront instead of running serially at
+  // the refresh barrier. Merged into proba->stats at each refresh.
+  proba_t* replay_buf;
   uint64_t size_p0;
   uint64_t distortion;
   SideInfoSums side_sums;
@@ -954,11 +958,17 @@ struct VP8WavefrontCtx {
   WavefrontProgress* row_progress; // per-row processed-MB count (padded)
   int next_row;            // next row to be claimed by a worker
   int phase_end;           // rows in [0, phase_end) can be processed
-  int rows_done;           // fully processed rows (they complete in order)
+  int rows_done;           // fully processed (and replayed) rows
   int abort;               // error or cancellation: stop as soon as possible
   int num_threads;         // total number of threads (including the caller)
   VP8WavefrontWorker* workers;  // one per thread
   WebPWorker* threads;          // auxiliary threads (num_threads - 1)
+  // Replay-stat scratch: replay_bufs[i] backs workers[i].replay_buf, holding
+  // full-precision [total[count], count[count]] for the current phase's rows.
+  proba_t** replay_bufs;        // one private stat buffer per worker
+  int replay_ok;                // 1 if buffers allocated (else serial replay)
+  int stats_count;              // proba_t counters in proba->stats
+  int stats_bytes;
 };
 
 // Returns true if macroblock 'x' of row 'y' can be processed ('y' > 0).
@@ -967,6 +977,57 @@ static int WavefrontReady(const VP8WavefrontCtx* const ctx, int x, int y) {
   int needed = x + 2;  // top and top-right neighbors must be reconstructed
   if (needed > ctx->enc->mb_w) needed = ctx->enc->mb_w;
   return (WfLoadAcquire(&ctx->row_progress[y - 1].v) >= needed);
+}
+
+// Folds one phase's per-worker replay buffers into proba->stats at a refresh
+// barrier, then clears them for the next phase. The token counts are commutative
+// across workers, and the buffers are full-precision (no per-worker overflow
+// halving), so the merged result is independent of how the rows were spread
+// across workers -> identical for a given thread count. Adding per phase into
+// the carried proba->stats keeps the recency weighting of the single-threaded
+// per-token halving. It is not bit-identical to the single-threaded replay
+// (the overflow halving is applied per-phase-batch instead of per-token) but
+// preserves the ratios/probabilities, so the size/quality impact is tiny.
+static void MergeReplayBufs(VP8WavefrontCtx* const ctx,
+                            VP8EncProba* const proba) {
+  proba_t* const stats = (proba_t*)proba->stats;
+  const int n = ctx->num_threads;
+  const int count = ctx->stats_count;
+  int i, c;
+  for (c = 0; c < count; ++c) {
+    uint64_t tot = stats[c] >> 16;
+    uint64_t nb = stats[c] & 0xffffu;
+    for (i = 0; i < n; ++i) {
+      const proba_t* const buf = ctx->replay_bufs[i];
+      tot += buf[c];           // full-precision total
+      nb += buf[count + c];    // full-precision count of 1-bits
+    }
+    while (tot >= 0xfffeu) {  // pack, halving as VP8RecordStats would
+      nb = (nb + 1) >> 1;
+      tot = (tot + 1) >> 1;
+    }
+    stats[c] = ((uint32_t)tot << 16) | (uint32_t)nb;
+  }
+  for (i = 0; i < n; ++i) {  // reset for the next phase
+    memset(ctx->replay_bufs[i], 0, 2 * ctx->stats_bytes);
+  }
+}
+
+// Called by the processing thread once row 'y' is done: replays its tokens into
+// the worker's private stat buffer (off the refresh-barrier critical path) and
+// marks the row complete. With no replay buffers the row is just marked done
+// and the barrier replays serially (see WavefrontOnePass).
+static void WavefrontFinishRow(VP8WavefrontWorker* const w, int y) {
+  VP8WavefrontCtx* const ctx = w->ctx;
+  if (ctx->replay_ok) {
+    // replay_buf holds [total[0..count), count[0..count)] (full precision).
+    VP8TokenReplayStatsWide(&ctx->row_tokens[y], w->replay_buf,
+                            w->replay_buf + ctx->stats_count);
+  }
+  WebPMonitorLock(ctx->monitor);
+  ++ctx->rows_done;
+  WebPMonitorBroadcast(ctx->monitor);
+  WebPMonitorUnlock(ctx->monitor);
 }
 
 static int WavefrontProcessRow(VP8WavefrontWorker* const w,
@@ -1016,13 +1077,12 @@ static int WavefrontProcessRow(VP8WavefrontWorker* const w,
     // block. Only grab the monitor to wake blocked workers / the caller, which
     // we still do every WAVEFRONT_SYNC_RANGE MBs and at row end / on error.
     WfStoreRelease(&ctx->row_progress[y].v, x + 1);
+    // rows_done is bumped by the caller after it replays the row's tokens; here
+    // we only publish progress (for the wavefront dependency) and propagate
+    // errors. The broadcast wakes any blocked dependent / the caller.
     if (!ok || ((x + 1) % WAVEFRONT_SYNC_RANGE) == 0 || (x + 1) == mb_w) {
       WebPMonitorLock(ctx->monitor);
-      if (!ok) {
-        ctx->abort = 1;
-      } else if ((x + 1) == mb_w) {
-        ++ctx->rows_done;
-      }
+      if (!ok) ctx->abort = 1;
       WebPMonitorBroadcast(ctx->monitor);
       WebPMonitorUnlock(ctx->monitor);
     }
@@ -1030,11 +1090,7 @@ static int WavefrontProcessRow(VP8WavefrontWorker* const w,
     if (!ok || ((x + 1) % WAVEFRONT_SYNC_RANGE) == 0 || (x + 1) == mb_w) {
       WebPMonitorLock(ctx->monitor);
       ctx->row_progress[y].v = x + 1;
-      if (!ok) {
-        ctx->abort = 1;
-      } else if ((x + 1) == mb_w) {
-        ++ctx->rows_done;
-      }
+      if (!ok) ctx->abort = 1;
       WebPMonitorBroadcast(ctx->monitor);
       WebPMonitorUnlock(ctx->monitor);
     }
@@ -1061,6 +1117,7 @@ static void WavefrontWorkLoop(VP8WavefrontWorker* const w,
     WebPMonitorUnlock(ctx->monitor);
     if (y < 0) break;  // aborted or no more rows
     if (!WavefrontProcessRow(w, it, y)) break;
+    WavefrontFinishRow(w, y);
   }
 }
 
@@ -1117,6 +1174,11 @@ static int WavefrontOnePass(VP8WavefrontCtx* const ctx,
     memset(&w->side_sums, 0, sizeof(w->side_sums));
     memset(&w->lf_stats, 0, sizeof(w->lf_stats));
   }
+  if (ctx->replay_ok) {  // clear the per-worker buffers for the first phase
+    for (i = 0; i < ctx->num_threads; ++i) {
+      memset(ctx->replay_bufs[i], 0, 2 * ctx->stats_bytes);  // total[] + count[]
+    }
+  }
   for (i = 1; i < ctx->num_threads; ++i) {
     winterface->Launch(&ctx->threads[i - 1]);
   }
@@ -1142,12 +1204,19 @@ static int WavefrontOnePass(VP8WavefrontCtx* const ctx,
         ok = 0;
         break;
       }
+      WavefrontFinishRow(&ctx->workers[0], y_claim);
       continue;
     }
-    // Here all the rows of the current phase are done: rebuild the canonical
-    // statistics by replaying the recorded tokens in raster order.
-    for (y = rows_replayed; y < ctx->phase_end; ++y) {
-      VP8TokenReplayStats(&ctx->row_tokens[y], (proba_t*)proba->stats);
+    // Here all the rows of the current phase are done. The canonical stats have
+    // already been built incrementally into the per-worker buffers (overlapping
+    // the wavefront); fold them into proba->stats. Without the buffers, replay
+    // the phase's rows serially here (the original behaviour).
+    if (ctx->replay_ok) {
+      MergeReplayBufs(ctx, proba);
+    } else {
+      for (y = rows_replayed; y < ctx->phase_end; ++y) {
+        VP8TokenReplayStats(&ctx->row_tokens[y], (proba_t*)proba->stats);
+      }
     }
     rows_replayed = ctx->phase_end;
     if (ctx->phase_end == mb_h) break;  // pass complete
@@ -1209,6 +1278,10 @@ static void WavefrontDelete(VP8WavefrontCtx* const ctx) {
         winterface->End(&ctx->threads[i - 1]);
       }
       WebPSafeFree(ctx->threads);
+    }
+    if (ctx->replay_bufs != NULL) {
+      for (i = 0; i < ctx->num_threads; ++i) WebPSafeFree(ctx->replay_bufs[i]);
+      WebPSafeFree(ctx->replay_bufs);
     }
     if (ctx->row_tokens != NULL) {
       for (i = 0; i < ctx->enc->mb_h; ++i) {
@@ -1281,6 +1354,31 @@ static VP8WavefrontCtx* WavefrontNew(VP8Encoder* const enc,
       ctx->num_threads = i;  // only End() the threads reset so far
       goto Error;
     }
+  }
+
+  // Per-worker token-replay buffers (overlap the replay with the wavefront).
+  // Best-effort: on allocation failure fall back to the serial barrier replay.
+  ctx->stats_bytes = (int)sizeof(enc->proba.stats);
+  ctx->stats_count = ctx->stats_bytes / (int)sizeof(proba_t);
+  ctx->replay_ok = 0;
+  if (num_threads >= 2) {
+    int rok = 1;
+    ctx->replay_bufs =
+        (proba_t**)WebPSafeCalloc(num_threads, sizeof(*ctx->replay_bufs));
+    if (ctx->replay_bufs == NULL) {
+      rok = 0;
+    } else {
+      for (i = 0; i < num_threads; ++i) {
+        // Wide buffer: full-precision total[] followed by count[].
+        ctx->replay_bufs[i] = (proba_t*)WebPSafeMalloc(2, ctx->stats_bytes);
+        if (ctx->replay_bufs[i] == NULL) {
+          rok = 0;
+          break;
+        }
+        ctx->workers[i].replay_buf = ctx->replay_bufs[i];
+      }
+    }
+    ctx->replay_ok = rok;
   }
   return ctx;
 
