@@ -1289,6 +1289,76 @@ static VP8WavefrontCtx* WavefrontNew(VP8Encoder* const enc,
   return NULL;
 }
 
+// Largest power of two <= 'num_threads', capped at the VP8 maximum number of
+// token partitions. The final entropy emit can use at most this many threads
+// (one sequential boolean stream per partition); a wider wavefront still uses
+// all its workers for token generation -- only the emit is bounded here.
+static int WavefrontNumParts(int num_threads) {
+  int n = 1;
+  while (n * 2 <= num_threads && n < MAX_NUM_PARTITIONS) n *= 2;
+  return n;
+}
+
+typedef struct {
+  VP8WavefrontCtx* ctx;
+  const uint8_t* probas;
+  int part;
+  int ok;
+} VP8EmitJob;
+
+// Emits every row assigned to partition 'part' (row y -> y & (num_parts - 1),
+// matching the decoder) into that partition's bit-writer, in row order.
+static int EmitPartitionBody(VP8WavefrontCtx* const ctx,
+                             const uint8_t* const probas, int part) {
+  VP8Encoder* const enc = ctx->enc;
+  const int num_parts = enc->num_parts;
+  VP8BitWriter* const bw = &enc->parts[part];
+  int y;
+  int ok = 1;
+  for (y = part; ok && y < enc->mb_h; y += num_parts) {
+    ok = VP8EmitTokens(&ctx->row_tokens[y], bw, probas, 1);
+  }
+  return ok;
+}
+
+static int EmitPartitionHook(void* arg1, void* arg2) {
+  VP8EmitJob* const job = (VP8EmitJob*)arg1;
+  (void)arg2;
+  job->ok = EmitPartitionBody(job->ctx, job->probas, job->part);
+  return job->ok;
+}
+
+// Writes the recorded tokens into the VP8 token partitions in parallel: each
+// partition is an independent boolean stream, so partition 0 is emitted on the
+// calling thread while partitions 1..num_parts-1 run on the wavefront's worker
+// threads. num_parts <= num_threads by construction (see WavefrontNumParts).
+static int WavefrontEmit(VP8WavefrontCtx* const ctx,
+                         const uint8_t* const probas) {
+  const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
+  const int num_parts = ctx->enc->num_parts;
+  VP8EmitJob jobs[MAX_NUM_PARTITIONS];
+  int p;
+  int ok;
+  assert(num_parts >= 1 && num_parts <= MAX_NUM_PARTITIONS);
+  assert(num_parts <= ctx->num_threads);
+  for (p = 1; p < num_parts; ++p) {
+    WebPWorker* const thread = &ctx->threads[p - 1];
+    jobs[p].ctx = ctx;
+    jobs[p].probas = probas;
+    jobs[p].part = p;
+    jobs[p].ok = 0;
+    thread->hook = EmitPartitionHook;
+    thread->data1 = &jobs[p];
+    thread->data2 = NULL;
+    winterface->Launch(thread);
+  }
+  ok = EmitPartitionBody(ctx, probas, 0);  // partition 0 on the caller
+  for (p = 1; p < num_parts; ++p) {
+    ok &= winterface->Sync(&ctx->threads[p - 1]) & jobs[p].ok;
+  }
+  return ok;
+}
+
 #endif  // WEBP_USE_THREAD
 
 int VP8EncTokenLoop(VP8Encoder* const enc) {
@@ -1310,8 +1380,6 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
   int ok;
 
   InitPassStats(enc, &stats);
-  ok = PreLoopInitialize(enc);
-  if (!ok) return 0;
 
   {
     const int min_rows = (MIN_COUNT + enc->mb_w - 1) / enc->mb_w;
@@ -1320,9 +1388,25 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
 #ifdef WEBP_USE_THREAD
   // returns NULL when multi-threading is off or not worth it
   wavefront = WavefrontNew(enc, rows_per_refresh);
+  if (wavefront != NULL) {
+    // Spread the recorded tokens over several VP8 token partitions so the final
+    // entropy emit can run in parallel as well (row y -> partition
+    // y & (num_parts - 1), as the decoder expects). Without the wavefront the
+    // tokens are interleaved in a single buffer and must stay in one partition.
+    enc->num_parts = WavefrontNumParts(wavefront->num_threads);
+  }
 #endif
+  // Must run after the num_parts bump above: it sizes and initializes one
+  // bit-writer per partition.
+  ok = PreLoopInitialize(enc);
+  if (!ok) {
+#ifdef WEBP_USE_THREAD
+    WavefrontDelete(wavefront);
+#endif
+    return 0;
+  }
 
-  assert(enc->num_parts == 1);
+  assert(enc->num_parts >= 1);
   assert(enc->use_tokens);
   assert(proba->use_skip_proba == 0);
   assert(rd_opt >= RD_OPT_BASIC);  // otherwise, token-buffer won't be useful
@@ -1435,11 +1519,7 @@ int VP8EncTokenLoop(VP8Encoder* const enc) {
     }
 #ifdef WEBP_USE_THREAD
     if (wavefront != NULL) {
-      int y;
-      for (y = 0; ok && y < enc->mb_h; ++y) {
-        ok = VP8EmitTokens(&wavefront->row_tokens[y], enc->parts + 0,
-                           (const uint8_t*)proba->coeffs, 1);
-      }
+      ok = WavefrontEmit(wavefront, (const uint8_t*)proba->coeffs);
     } else
 #endif
     {
