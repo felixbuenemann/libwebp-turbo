@@ -945,6 +945,154 @@ static int64_t HistoQueuePush(HistoQueue* const histo_queue,
 }
 
 // -----------------------------------------------------------------------------
+// Parallel cost pre-evaluation for the stochastic combiner.
+//
+// HistogramCombineStochastic spends most of its time evaluating the combine
+// cost (GetCombinedHistogramEntropy) of randomly picked histogram pairs. Those
+// evaluations are read-only on the histograms and independent of each other, so
+// within one outer iteration they can be computed in parallel. To stay
+// bit-identical to the single-threaded encoder we: (1) draw the same random
+// pairs in the same order (snapshotting the RNG after each draw), (2) evaluate
+// their full costs in parallel, then (3) replay the exact serial queue/early-
+// break logic using the cached costs and rewind the RNG to the break point.
+
+#ifdef WEBP_USE_THREAD
+
+// Cached full-cost evaluation of one candidate pair.
+typedef struct {
+  int idx1, idx2;
+  int valid;  // 0 if the entropy could not be computed (treated as a reject)
+  uint64_t cost_combo;
+  uint64_t costs[5];
+} StochEval;
+
+typedef struct {
+  VP8LHistogram** histograms;
+  StochEval* evals;
+  int from, to;
+} StochJob;
+
+static int StochJobHook(void* arg1, void* arg2) {
+  StochJob* const job = (StochJob*)arg1;
+  int j;
+  (void)arg2;
+  for (j = job->from; j < job->to; ++j) {
+    StochEval* const e = &job->evals[j];
+    // WEBP_INT64_MAX threshold => no early bail-out: compute the full cost.
+    e->valid = GetCombinedHistogramEntropy(job->histograms[e->idx1],
+                                           job->histograms[e->idx2],
+                                           WEBP_INT64_MAX, &e->cost_combo,
+                                           e->costs);
+  }
+  return 1;
+}
+
+#define STOCH_MAX_AUX 63       // worker threads in addition to the caller
+#define STOCH_MIN_PARALLEL 256 // only parallelize iterations with >= this tries
+
+typedef struct {
+  int num_aux;  // number of auxiliary worker threads (caller runs too)
+  WebPWorker workers[STOCH_MAX_AUX];
+  StochJob jobs[STOCH_MAX_AUX + 1];  // [0] = caller, [1..num_aux] = aux
+} StochPool;
+
+static void StochPoolEnd(StochPool* const pool) {
+  const WebPWorkerInterface* const wi = WebPGetWorkerInterface();
+  int i;
+  for (i = 0; i < pool->num_aux; ++i) wi->End(&pool->workers[i]);
+  pool->num_aux = 0;
+}
+
+// Creates the persistent worker pool, or returns 0 (then run single-threaded).
+static int StochPoolInit(StochPool* const pool) {
+  const WebPWorkerInterface* const wi = WebPGetWorkerInterface();
+  int num_aux = WebPNumThreadsHint() - 1;  // the caller is one runner
+  int i;
+  if (num_aux > STOCH_MAX_AUX) num_aux = STOCH_MAX_AUX;
+  if (num_aux < 1) return 0;  // nothing to gain
+  pool->num_aux = 0;
+  for (i = 0; i < num_aux; ++i) {
+    wi->Init(&pool->workers[i]);
+    if (!wi->Reset(&pool->workers[i])) break;  // starts the thread
+    pool->workers[i].hook = StochJobHook;
+    pool->workers[i].data2 = NULL;
+    pool->num_aux = i + 1;
+  }
+  if (pool->num_aux < 1) {
+    StochPoolEnd(pool);
+    return 0;
+  }
+  return 1;
+}
+
+// Evaluates evals[0, count) across the pool (caller included) and waits.
+static void StochPoolRun(StochPool* const pool, VP8LHistogram** const histograms,
+                         StochEval* const evals, int count) {
+  const WebPWorkerInterface* const wi = WebPGetWorkerInterface();
+  const int num_runners = pool->num_aux + 1;
+  const int chunk = (count + num_runners - 1) / num_runners;
+  int a;
+  for (a = 0; a < pool->num_aux; ++a) {
+    StochJob* const job = &pool->jobs[a + 1];
+    int from = (a + 1) * chunk;
+    int to = from + chunk;
+    if (from > count) from = count;
+    if (to > count) to = count;
+    job->histograms = histograms;
+    job->evals = evals;
+    job->from = from;
+    job->to = to;
+    pool->workers[a].data1 = job;
+    wi->Launch(&pool->workers[a]);
+  }
+  {  // the caller runs the first chunk
+    StochJob* const job = &pool->jobs[0];
+    int to = chunk;
+    if (to > count) to = count;
+    job->histograms = histograms;
+    job->evals = evals;
+    job->from = 0;
+    job->to = to;
+    StochJobHook(job, NULL);
+  }
+  for (a = 0; a < pool->num_aux; ++a) wi->Sync(&pool->workers[a]);
+}
+
+// Bit-exact replacement for HistoQueuePush that uses a precomputed cost. It
+// reproduces HistoQueueUpdatePair's accept test (cost_combo < sum_cost +
+// threshold) exactly, using the full cost computed in parallel.
+static int64_t HistoQueuePushCached(HistoQueue* const histo_queue,
+                                    VP8LHistogram** const histograms,
+                                    const StochEval* const e, int64_t threshold) {
+  HistogramPair pair;
+  int idx1 = e->idx1, idx2 = e->idx2;
+  int64_t sum_cost, cost_threshold;
+  if (histo_queue->size == histo_queue->max_size) return 0;
+  assert(threshold <= 0);
+  if (idx1 > idx2) {
+    const int tmp = idx2;
+    idx2 = idx1;
+    idx1 = tmp;
+  }
+  if (!e->valid) return 0;
+  sum_cost = histograms[idx1]->bit_cost + histograms[idx2]->bit_cost;
+  cost_threshold = threshold;
+  SaturateAdd(sum_cost, &cost_threshold);  // cost_threshold = sum_cost+threshold
+  if (cost_threshold <= 0) return 0;
+  if (e->cost_combo >= (uint64_t)cost_threshold) return 0;  // not enough gain
+  pair.idx1 = idx1;
+  pair.idx2 = idx2;
+  pair.cost_combo = e->cost_combo;
+  memcpy(pair.costs, e->costs, sizeof(pair.costs));
+  pair.cost_diff = (int64_t)e->cost_combo - sum_cost;
+  histo_queue->queue[histo_queue->size++] = pair;
+  HistoQueueUpdateHead(histo_queue, &histo_queue->queue[histo_queue->size - 1]);
+  return pair.cost_diff;
+}
+
+#endif  // WEBP_USE_THREAD
+
+// -----------------------------------------------------------------------------
 
 // Combines histograms by continuously choosing the one with the highest cost
 // reduction.
@@ -1015,7 +1163,7 @@ End:
 // 'do_greedy' is set to 1 if a greedy approach needs to be performed
 // afterwards, 0 otherwise.
 static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
-                                      int min_cluster_size,
+                                      int min_cluster_size, int use_threads,
                                       int* const do_greedy) {
   int j, iter;
   uint32_t seed = 1;
@@ -1029,6 +1177,16 @@ static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
   HistoQueue histo_queue;
   const int kHistoQueueSize = 9;
   int ok = 0;
+#ifdef WEBP_USE_THREAD
+  // Scratch for the parallel cost pre-evaluation (bit-exact; see above).
+  const int max_tries = outer_iters / 2;  // num_tries is largest in iter 0
+  StochEval* evals = NULL;
+  uint32_t* seed_snap = NULL;
+  StochPool pool;
+  int pool_ok = 0;
+#else
+  (void)use_threads;
+#endif
 
   if (image_histo->size < min_cluster_size) {
     *do_greedy = 1;
@@ -1036,6 +1194,20 @@ static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
   }
 
   if (!HistoQueueInit(&histo_queue, kHistoQueueSize)) goto End;
+
+#ifdef WEBP_USE_THREAD
+  if (use_threads && max_tries >= STOCH_MIN_PARALLEL) {
+    evals = (StochEval*)WebPSafeMalloc(max_tries, sizeof(*evals));
+    seed_snap = (uint32_t*)WebPSafeMalloc(max_tries, sizeof(*seed_snap));
+    if (evals != NULL && seed_snap != NULL) pool_ok = StochPoolInit(&pool);
+    if (!pool_ok) {
+      WebPSafeFree(evals);
+      evals = NULL;
+      WebPSafeFree(seed_snap);
+      seed_snap = NULL;
+    }
+  }
+#endif
 
   // Collapse similar histograms in 'image_histo'.
   for (iter = 0; iter < outer_iters && image_histo->size >= min_cluster_size &&
@@ -1050,6 +1222,34 @@ static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
     const int num_tries = (image_histo->size) / 2;
 
     // Pick random samples.
+#ifdef WEBP_USE_THREAD
+    if (pool_ok && image_histo->size >= 2 && num_tries >= STOCH_MIN_PARALLEL) {
+      // Draw the same pairs in order, snapshotting the RNG after each draw.
+      for (j = 0; j < num_tries; ++j) {
+        const uint32_t tmp = MyRand(&seed) % rand_range;
+        uint32_t idx1 = tmp / (image_histo->size - 1);
+        uint32_t idx2 = tmp % (image_histo->size - 1);
+        if (idx2 >= idx1) ++idx2;
+        evals[j].idx1 = (int)idx1;
+        evals[j].idx2 = (int)idx2;
+        seed_snap[j] = seed;
+      }
+      // Evaluate the (independent) combine costs in parallel.
+      StochPoolRun(&pool, histograms, evals, num_tries);
+      // Replay the exact serial queue/early-break logic using cached costs.
+      for (j = 0; j < num_tries; ++j) {
+        const int64_t curr_cost =
+            HistoQueuePushCached(&histo_queue, histograms, &evals[j], best_cost);
+        if (curr_cost < 0) {
+          best_cost = curr_cost;
+          if (histo_queue.size == histo_queue.max_size) break;
+        }
+      }
+      // Rewind the RNG to where the serial loop would have stopped, so the
+      // following iterations stay bit-identical.
+      if (j < num_tries) seed = seed_snap[j];
+    } else
+#endif
     for (j = 0; image_histo->size >= 2 && j < num_tries; ++j) {
       int64_t curr_cost;
       // Choose two different histograms at random and try to combine them.
@@ -1112,6 +1312,11 @@ static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
   ok = 1;
 
 End:
+#ifdef WEBP_USE_THREAD
+  if (pool_ok) StochPoolEnd(&pool);
+  WebPSafeFree(evals);
+  WebPSafeFree(seed_snap);
+#endif
   HistoQueueClear(&histo_queue);
   return ok;
 }
@@ -1319,7 +1524,8 @@ int VP8LGetHistoImageSymbols(int xsize, int ysize,
         (int)(1 + DivRound(quality * quality * quality * (MAX_HISTO_GREEDY - 1),
                            100 * 100 * 100));
     int do_greedy;
-    if (!HistogramCombineStochastic(image_histo, threshold_size, &do_greedy)) {
+    if (!HistogramCombineStochastic(image_histo, threshold_size, use_threads,
+                                    &do_greedy)) {
       WebPEncodingSetError(pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
       goto Error;
     }
