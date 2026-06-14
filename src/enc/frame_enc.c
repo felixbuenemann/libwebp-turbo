@@ -13,6 +13,7 @@
 
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "src/dec/common_dec.h"
@@ -870,9 +871,65 @@ int VP8EncLoop(VP8Encoder* const enc) {
 
 #ifdef WEBP_USE_THREAD
 
-#define WAVEFRONT_SYNC_RANGE 16  // publish progress every that many MBs
-#define WAVEFRONT_MAX_THREADS 8
+#if defined(_WIN32)
+#include <windows.h>  // GetSystemInfo()
+#else
+#include <unistd.h>   // sysconf()
+#endif
+
+// Broadcast progress to the waiting workers at least every that many MBs (the
+// actual per-MB value is published lock-free; see WfStoreRelease()).
+#define WAVEFRONT_SYNC_RANGE 16
+// Upper bound on worker threads. The effective count is min(this, detected
+// processors or the WEBP_ENC_THREADS override, and half the macroblock rows).
+#define WAVEFRONT_MAX_THREADS 64
 #define WAVEFRONT_MIN_MB_ROWS 4  // don't bother below that many rows
+
+// Size of a cache line (128 covers Apple Silicon; 64 elsewhere). The per-row
+// progress counters are padded to this so a producer writing its own row does
+// not invalidate the counters that other workers poll (false sharing).
+#define WAVEFRONT_CACHE_LINE 128
+
+// Lock-free access to the per-row progress counters. A worker publishes its
+// row's progress with a release store; the worker on the row below observes it
+// with an acquire load and only blocks on the monitor when the dependency is
+// genuinely not satisfied yet. This removes the per-macroblock mutex round-trip
+// that otherwise serializes all workers on a single global lock. Compilers
+// without the GCC/Clang atomic builtins fall back to the original always-locked
+// path (correct, just with the old contention).
+#if defined(__GNUC__) || defined(__clang__)
+#define WAVEFRONT_LOCKFREE 1
+static WEBP_INLINE int WfLoadAcquire(const int* const p) {
+  return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+static WEBP_INLINE void WfStoreRelease(int* const p, int v) {
+  __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+#else
+#define WAVEFRONT_LOCKFREE 0
+static WEBP_INLINE int WfLoadAcquire(const int* const p) { return *p; }
+static WEBP_INLINE void WfStoreRelease(int* const p, int v) { *p = v; }
+#endif
+
+// One per macroblock row, padded to its own cache line (see above).
+typedef union {
+  int v;  // number of processed macroblocks on the row
+  char padding[WAVEFRONT_CACHE_LINE];
+} WavefrontProgress;
+
+// Number of logical processors available, or 1 if it cannot be determined.
+static int WavefrontDetectProcessors(void) {
+#if defined(_WIN32)
+  SYSTEM_INFO info;
+  GetSystemInfo(&info);
+  return (info.dwNumberOfProcessors > 0) ? (int)info.dwNumberOfProcessors : 1;
+#elif defined(_SC_NPROCESSORS_ONLN)
+  const long n = sysconf(_SC_NPROCESSORS_ONLN);
+  return (n > 0) ? (int)n : 1;
+#else
+  return 1;
+#endif
+}
 
 typedef struct VP8WavefrontCtx VP8WavefrontCtx;
 
@@ -893,8 +950,8 @@ struct VP8WavefrontCtx {
   VP8RDLevel rd_opt;
   int is_last_pass;
   int rows_per_refresh;
-  VP8TBuffer* row_tokens;  // per-row recorded tokens
-  int* row_progress;       // per-row number of processed macroblocks
+  VP8TBuffer* row_tokens;          // per-row recorded tokens
+  WavefrontProgress* row_progress; // per-row processed-MB count (padded)
   int next_row;            // next row to be claimed by a worker
   int phase_end;           // rows in [0, phase_end) can be processed
   int rows_done;           // fully processed rows (they complete in order)
@@ -909,7 +966,7 @@ struct VP8WavefrontCtx {
 static int WavefrontReady(const VP8WavefrontCtx* const ctx, int x, int y) {
   int needed = x + 2;  // top and top-right neighbors must be reconstructed
   if (needed > ctx->enc->mb_w) needed = ctx->enc->mb_w;
-  return (ctx->row_progress[y - 1] >= needed);
+  return (WfLoadAcquire(&ctx->row_progress[y - 1].v) >= needed);
 }
 
 static int WavefrontProcessRow(VP8WavefrontWorker* const w,
@@ -924,13 +981,22 @@ static int WavefrontProcessRow(VP8WavefrontWorker* const w,
   for (x = 0; ok && x < mb_w; ++x) {
     VP8ModeScore info;
     if (y > 0) {  // wait for the wavefront dependency
-      WebPMonitorLock(ctx->monitor);
-      while (!ctx->abort && !WavefrontReady(ctx, x, y)) {
-        WebPMonitorWait(ctx->monitor);
+      // Lock-free fast path: when the row above has already published enough
+      // progress (the common case once the wavefront is established) we proceed
+      // without touching the monitor at all. Only block when it has not. The
+      // fallback (no atomic builtins) always takes the slow, locked path.
+#if WAVEFRONT_LOCKFREE
+      if (!WavefrontReady(ctx, x, y))
+#endif
+      {
+        WebPMonitorLock(ctx->monitor);
+        while (!ctx->abort && !WavefrontReady(ctx, x, y)) {
+          WebPMonitorWait(ctx->monitor);
+        }
+        ok = !ctx->abort;
+        WebPMonitorUnlock(ctx->monitor);
+        if (!ok) break;
       }
-      ok = !ctx->abort;
-      WebPMonitorUnlock(ctx->monitor);
-      if (!ok) break;
     }
     VP8IteratorImport(it, NULL);
     VP8Decimate(it, &info, ctx->rd_opt);
@@ -944,9 +1010,14 @@ static int WavefrontProcessRow(VP8WavefrontWorker* const w,
     }
     VP8IteratorSaveBoundary(it);
     (void)VP8IteratorNext(it);
+#if WAVEFRONT_LOCKFREE
+    // Publish progress every macroblock with a release store so the worker on
+    // the row below advances with single-MB granularity and rarely has to
+    // block. Only grab the monitor to wake blocked workers / the caller, which
+    // we still do every WAVEFRONT_SYNC_RANGE MBs and at row end / on error.
+    WfStoreRelease(&ctx->row_progress[y].v, x + 1);
     if (!ok || ((x + 1) % WAVEFRONT_SYNC_RANGE) == 0 || (x + 1) == mb_w) {
       WebPMonitorLock(ctx->monitor);
-      ctx->row_progress[y] = x + 1;
       if (!ok) {
         ctx->abort = 1;
       } else if ((x + 1) == mb_w) {
@@ -955,6 +1026,19 @@ static int WavefrontProcessRow(VP8WavefrontWorker* const w,
       WebPMonitorBroadcast(ctx->monitor);
       WebPMonitorUnlock(ctx->monitor);
     }
+#else
+    if (!ok || ((x + 1) % WAVEFRONT_SYNC_RANGE) == 0 || (x + 1) == mb_w) {
+      WebPMonitorLock(ctx->monitor);
+      ctx->row_progress[y].v = x + 1;
+      if (!ok) {
+        ctx->abort = 1;
+      } else if ((x + 1) == mb_w) {
+        ++ctx->rows_done;
+      }
+      WebPMonitorBroadcast(ctx->monitor);
+      WebPMonitorUnlock(ctx->monitor);
+    }
+#endif
   }
   return ok;
 }
@@ -1023,7 +1107,7 @@ static int WavefrontOnePass(VP8WavefrontCtx* const ctx,
   ctx->phase_end =
       (ctx->rows_per_refresh < mb_h) ? ctx->rows_per_refresh : mb_h;
   for (y = 0; y < mb_h; ++y) {
-    ctx->row_progress[y] = 0;
+    ctx->row_progress[y].v = 0;  // single-threaded here (before Launch)
     VP8TBufferClear(&ctx->row_tokens[y]);
   }
   for (i = 0; i < ctx->num_threads; ++i) {
@@ -1146,11 +1230,21 @@ static VP8WavefrontCtx* WavefrontNew(VP8Encoder* const enc,
                                      int rows_per_refresh) {
   const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
   VP8WavefrontCtx* ctx = NULL;
-  int num_threads = WAVEFRONT_MAX_THREADS;
+  int num_threads;
   int i;
   if (enc->thread_level <= 0) return NULL;
   if (enc->mb_h < WAVEFRONT_MIN_MB_ROWS) return NULL;
+  // Scale to the machine by default. WEBP_ENC_THREADS overrides the count
+  // (e.g. to match a cgroup cpu quota, which the OS processor count ignores);
+  // '1' effectively disables the wavefront.
+  {
+    const char* const env = getenv("WEBP_ENC_THREADS");
+    num_threads = (env != NULL) ? atoi(env) : WavefrontDetectProcessors();
+  }
+  if (num_threads > WAVEFRONT_MAX_THREADS) num_threads = WAVEFRONT_MAX_THREADS;
+  // a wavefront needs at least two rows per worker for a useful stagger
   if (num_threads > (enc->mb_h + 1) / 2) num_threads = (enc->mb_h + 1) / 2;
+  if (num_threads < 1) num_threads = 1;
 
   ctx = (VP8WavefrontCtx*)WebPSafeCalloc(1ULL, sizeof(*ctx));
   if (ctx == NULL) return NULL;
@@ -1160,8 +1254,8 @@ static VP8WavefrontCtx* WavefrontNew(VP8Encoder* const enc,
   ctx->monitor = WebPMonitorNew();
   ctx->row_tokens =
       (VP8TBuffer*)WebPSafeCalloc(enc->mb_h, sizeof(*ctx->row_tokens));
-  ctx->row_progress =
-      (int*)WebPSafeCalloc(enc->mb_h, sizeof(*ctx->row_progress));
+  ctx->row_progress = (WavefrontProgress*)WebPSafeCalloc(
+      enc->mb_h, sizeof(*ctx->row_progress));
   ctx->workers = (VP8WavefrontWorker*)WebPSafeCalloc(
       num_threads, sizeof(*ctx->workers));
   ctx->threads =
