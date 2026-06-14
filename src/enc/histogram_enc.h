@@ -113,6 +113,7 @@ static WEBP_INLINE int VP8LHistogramNumCodes(int palette_code_bits) {
 int VP8LGetHistoImageSymbols(int xsize, int ysize,
                              const VP8LBackwardRefs* const refs, int quality,
                              int low_effort, int histogram_bits, int cache_bits,
+                             int use_threads,
                              VP8LHistogramSet* const image_histo,
                              VP8LHistogram* const tmp_histo,
                              uint32_t* const histogram_symbols,

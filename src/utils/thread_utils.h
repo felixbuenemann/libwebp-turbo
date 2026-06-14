@@ -84,6 +84,13 @@ WEBP_EXTERN int WebPSetWorkerInterface(
 // Retrieve the currently set thread worker interface.
 WEBP_EXTERN const WebPWorkerInterface* WebPGetWorkerInterface(void);
 
+// Suggested number of worker threads for a parallel phase: the WEBP_ENC_THREADS
+// environment override if set (>= 1), otherwise the number of logical
+// processors (or 1 if it cannot be determined). Callers should additionally cap
+// this by the amount of available work. Returns 1 when threading is disabled at
+// compile time.
+WEBP_EXTERN int WebPNumThreadsHint(void);
+
 //------------------------------------------------------------------------------
 // Lightweight monitor (a mutex paired with a condition variable), for
 // fine-grained synchronization between workers (e.g. wavefront encoding).

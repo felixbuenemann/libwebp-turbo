@@ -940,8 +940,8 @@ static int EncodeImageInternal(
       i_remaining_percent -= i_percent_range;
       if (!VP8LGetHistoImageSymbols(
               width, height, &refs_array[i_cache], quality, low_effort,
-              histogram_bits, cache_bits_tmp, histogram_image, tmp_histo,
-              histogram_argb, pic, i_percent_range, percent)) {
+              histogram_bits, cache_bits_tmp, use_threads, histogram_image,
+              tmp_histo, histogram_argb, pic, i_percent_range, percent)) {
         goto Error;
       }
       // Create Huffman bit lengths and codes for each histogram image.

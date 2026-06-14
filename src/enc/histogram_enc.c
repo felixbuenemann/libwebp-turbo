@@ -22,6 +22,7 @@
 #include "src/enc/backward_references_enc.h"
 #include "src/enc/histogram_enc.h"
 #include "src/enc/vp8i_enc.h"
+#include "src/utils/thread_utils.h"
 #include "src/utils/utils.h"
 #include "src/webp/encode.h"
 #include "src/webp/format_constants.h"
@@ -1121,33 +1122,122 @@ End:
 // Find the best 'out' histogram for each of the 'in' histograms.
 // At call-time, 'out' contains the histograms of the clusters.
 // Note: we assume that out[]->bit_cost is already up-to-date.
+// Finds, for each non-NULL input histogram in [from, to), the output cluster
+// histogram it is cheapest to assign to, writing the index into 'symbols'.
+// Each entry is independent (NULL entries are filled in a serial pass), so the
+// range can be processed by a worker thread.
+static void RemapAssignRange(VP8LHistogram** const in_histo,
+                             VP8LHistogram** const out_histo, int out_size,
+                             uint32_t* const symbols, int from, int to) {
+  int i;
+  for (i = from; i < to; ++i) {
+    int best_out = 0;
+    int64_t best_bits = WEBP_INT64_MAX;
+    int k;
+    if (in_histo[i] == NULL) continue;  // filled in the serial NULL pass
+    for (k = 0; k < out_size; ++k) {
+      int64_t cur_bits;
+      if (HistogramAddThresh(out_histo[k], in_histo[i], best_bits, &cur_bits)) {
+        best_bits = cur_bits;
+        best_out = k;
+      }
+    }
+    symbols[i] = best_out;
+  }
+}
+
+#ifdef WEBP_USE_THREAD
+// One assignment worker over a contiguous range of input histograms.
+typedef struct {
+  VP8LHistogram** in_histo;
+  VP8LHistogram** out_histo;
+  int out_size;
+  uint32_t* symbols;
+  int from, to;
+} RemapJob;
+
+static int RemapJobHook(void* arg1, void* arg2) {
+  RemapJob* const job = (RemapJob*)arg1;
+  (void)arg2;
+  RemapAssignRange(job->in_histo, job->out_histo, job->out_size, job->symbols,
+                   job->from, job->to);
+  return 1;
+}
+
+#define REMAP_MAX_WORKERS 64
+#define REMAP_MIN_PER_WORKER 64  // not worth a thread below this many entries
+
+// Multi-threaded version of the assignment loop. Returns 0 if multi-threading
+// could not be set up; the caller then falls back to the single-threaded path.
+static int RemapAssignMT(VP8LHistogram** const in_histo,
+                         VP8LHistogram** const out_histo, int out_size,
+                         uint32_t* const symbols, int in_size) {
+  const WebPWorkerInterface* const winterface = WebPGetWorkerInterface();
+  int num_workers = WebPNumThreadsHint();
+  WebPWorker workers[REMAP_MAX_WORKERS];
+  RemapJob jobs[REMAP_MAX_WORKERS];
+  int i, ok = 1;
+  int started = 0;
+  int chunk;
+  if (num_workers > REMAP_MAX_WORKERS) num_workers = REMAP_MAX_WORKERS;
+  if (num_workers > in_size / REMAP_MIN_PER_WORKER) {
+    num_workers = in_size / REMAP_MIN_PER_WORKER;
+  }
+  if (num_workers < 2) return 0;
+  chunk = (in_size + num_workers - 1) / num_workers;
+
+  for (i = 0; i < num_workers; ++i) {
+    const int from = i * chunk;
+    int to = from + chunk;
+    if (to > in_size) to = in_size;
+    jobs[i].in_histo = in_histo;
+    jobs[i].out_histo = out_histo;
+    jobs[i].out_size = out_size;
+    jobs[i].symbols = symbols;
+    jobs[i].from = from;
+    jobs[i].to = to;
+    winterface->Init(&workers[i]);
+    workers[i].data1 = &jobs[i];
+    workers[i].data2 = NULL;
+    workers[i].hook = RemapJobHook;
+  }
+  for (i = 0; ok && i < num_workers; ++i) {
+    ok = winterface->Reset(&workers[i]);
+    if (ok) started = i + 1;
+  }
+  if (ok) {
+    for (i = 0; i < num_workers; ++i) winterface->Launch(&workers[i]);
+    for (i = 0; i < num_workers; ++i) ok &= winterface->Sync(&workers[i]);
+  }
+  for (i = 0; i < started; ++i) winterface->End(&workers[i]);
+  return ok;
+}
+#endif  // WEBP_USE_THREAD
+
 static void HistogramRemap(const VP8LHistogramSet* const in,
                            VP8LHistogramSet* const out,
-                           uint32_t* const symbols) {
+                           uint32_t* const symbols, int use_threads) {
   int i;
   VP8LHistogram** const in_histo = in->histograms;
   VP8LHistogram** const out_histo = out->histograms;
   const int in_size = out->max_size;
   const int out_size = out->size;
   if (out_size > 1) {
+    int done = 0;
+#ifdef WEBP_USE_THREAD
+    if (use_threads) {
+      done = RemapAssignMT(in_histo, out_histo, out_size, symbols, in_size);
+    }
+#else
+    (void)use_threads;
+#endif
+    if (!done) {
+      RemapAssignRange(in_histo, out_histo, out_size, symbols, 0, in_size);
+    }
+    // Fill the NULL (unused) entries serially: arbitrarily reuse the previous
+    // symbol to help future LZ77. This carry is why it is a separate pass.
     for (i = 0; i < in_size; ++i) {
-      int best_out = 0;
-      int64_t best_bits = WEBP_INT64_MAX;
-      int k;
-      if (in_histo[i] == NULL) {
-        // Arbitrarily set to the previous value if unused to help future LZ77.
-        symbols[i] = symbols[i - 1];
-        continue;
-      }
-      for (k = 0; k < out_size; ++k) {
-        int64_t cur_bits;
-        if (HistogramAddThresh(out_histo[k], in_histo[i], best_bits,
-                               &cur_bits)) {
-          best_bits = cur_bits;
-          best_out = k;
-        }
-      }
-      symbols[i] = best_out;
+      if (in_histo[i] == NULL) symbols[i] = (i > 0) ? symbols[i - 1] : 0;
     }
   } else {
     assert(out_size == 1);
@@ -1182,6 +1272,7 @@ static int32_t GetCombineCostFactor(int histo_size, int quality) {
 int VP8LGetHistoImageSymbols(int xsize, int ysize,
                              const VP8LBackwardRefs* const refs, int quality,
                              int low_effort, int histogram_bits, int cache_bits,
+                             int use_threads,
                              VP8LHistogramSet* const image_histo,
                              VP8LHistogram* const tmp_histo,
                              uint32_t* const histogram_symbols,
@@ -1241,7 +1332,7 @@ int VP8LGetHistoImageSymbols(int xsize, int ysize,
   }
 
   // Find the optimal map from original histograms to the final ones.
-  HistogramRemap(orig_histo, image_histo, histogram_symbols);
+  HistogramRemap(orig_histo, image_histo, histogram_symbols, use_threads);
 
   if (!WebPReportProgress(pic, *percent + percent_range, percent)) {
     goto Error;

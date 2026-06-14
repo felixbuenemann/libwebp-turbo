@@ -370,3 +370,41 @@ void WebPMonitorBroadcast(void* monitor) { (void)monitor; }
 #endif  // WEBP_USE_THREAD
 
 //------------------------------------------------------------------------------
+// Worker-count hint
+
+#ifdef WEBP_USE_THREAD
+
+#include <stdlib.h>  // getenv(), atoi()
+#if !defined(_WIN32)
+#include <unistd.h>  // sysconf()
+#endif
+
+static int NumProcessors(void) {
+#if defined(_WIN32)
+  SYSTEM_INFO info;
+  GetSystemInfo(&info);
+  return (info.dwNumberOfProcessors > 0) ? (int)info.dwNumberOfProcessors : 1;
+#elif defined(_SC_NPROCESSORS_ONLN)
+  const long n = sysconf(_SC_NPROCESSORS_ONLN);
+  return (n > 0) ? (int)n : 1;
+#else
+  return 1;
+#endif
+}
+
+int WebPNumThreadsHint(void) {
+  const char* const env = getenv("WEBP_ENC_THREADS");
+  if (env != NULL) {
+    const int n = atoi(env);
+    return (n >= 1) ? n : 1;
+  }
+  return NumProcessors();
+}
+
+#else  // !WEBP_USE_THREAD
+
+int WebPNumThreadsHint(void) { return 1; }
+
+#endif  // WEBP_USE_THREAD
+
+//------------------------------------------------------------------------------
