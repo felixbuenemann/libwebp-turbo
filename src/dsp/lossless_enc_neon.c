@@ -18,7 +18,9 @@
 #include <arm_neon.h>
 
 #include "src/dsp/lossless.h"
+#include "src/dsp/lossless_common.h"
 #include "src/dsp/neon.h"
+#include "src/utils/utils.h"
 #include "src/webp/format_constants.h"
 
 //------------------------------------------------------------------------------
@@ -531,6 +533,58 @@ static int VectorMismatch_NEON(const uint32_t* const array1,
 }
 
 //------------------------------------------------------------------------------
+// Combined Shannon entropy (sparse-histogram cost)
+
+// Returns non-zero iff any of the 16 bins (8 lanes across two vectors per side)
+// is set, i.e. the 16-bin block has at least one non-zero X or Y entry.
+static WEBP_INLINE uint32_t BlockNonZero_NEON(uint32x4_t a, uint32x4_t b,
+                                              uint32x4_t c, uint32x4_t d) {
+  const uint32x4_t any = vorrq_u32(vorrq_u32(a, b), vorrq_u32(c, d));
+  const uint32x2_t r = vorr_u32(vget_low_u32(any), vget_high_u32(any));
+  return vget_lane_u32(r, 0) | vget_lane_u32(r, 1);
+}
+
+// Same result as CombinedShannonEntropy_C. Histograms are sparse, so cheaply
+// skip whole 16-bin blocks that are entirely zero (one OR-reduce, no per-bin
+// work); for non-empty blocks fall back to the exact scalar inner loop. This
+// avoids the set-bit-iteration cost that makes a movemask approach lose on the
+// dense histograms where there is nothing to skip (NEON has no cheap movemask),
+// so it is never slower than scalar and faster on the sparse common case.
+static uint64_t CombinedShannonEntropy_NEON(const uint32_t X[256],
+                                            const uint32_t Y[256]) {
+  int i;
+  uint64_t retval = 0;
+  uint32_t sumX = 0, sumXY = 0;
+  for (i = 0; i < 256; i += 16) {
+    const uint32x4_t x0 = vld1q_u32(X + i + 0), x1 = vld1q_u32(X + i + 4);
+    const uint32x4_t x2 = vld1q_u32(X + i + 8), x3 = vld1q_u32(X + i + 12);
+    if (!BlockNonZero_NEON(x0, x1, x2, x3) &&
+        !BlockNonZero_NEON(vld1q_u32(Y + i + 0), vld1q_u32(Y + i + 4),
+                           vld1q_u32(Y + i + 8), vld1q_u32(Y + i + 12))) {
+      continue;  // all 16 X and Y bins zero -> nothing to add
+    }
+    {
+      int j;
+      for (j = i; j < i + 16; ++j) {
+        const uint32_t x = X[j];
+        if (x != 0) {
+          const uint32_t xy = x + Y[j];
+          sumX += x;
+          retval += VP8LFastSLog2(x);
+          sumXY += xy;
+          retval += VP8LFastSLog2(xy);
+        } else if (Y[j] != 0) {
+          sumXY += Y[j];
+          retval += VP8LFastSLog2(Y[j]);
+        }
+      }
+    }
+  }
+  retval = VP8LFastSLog2(sumX) + VP8LFastSLog2(sumXY) - retval;
+  return retval;
+}
+
+//------------------------------------------------------------------------------
 // Entry point
 
 extern void VP8LEncDspInitNEON(void);
@@ -542,6 +596,7 @@ WEBP_TSAN_IGNORE_FUNCTION void VP8LEncDspInitNEON(void) {
   VP8LCollectColorRedTransforms = CollectColorRedTransforms_NEON;
   VP8LCollectArgbHistos = CollectArgbHistos_NEON;
   VP8LVectorMismatch = VectorMismatch_NEON;
+  VP8LCombinedShannonEntropy = CombinedShannonEntropy_NEON;
 
   VP8LPredictorsSub[0] = PredictorSub0_NEON;
   VP8LPredictorsSub[1] = PredictorSub1_NEON;
