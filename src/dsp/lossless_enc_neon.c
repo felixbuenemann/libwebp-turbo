@@ -460,6 +460,77 @@ static void PredictorSub13_NEON(const uint32_t* in, const uint32_t* upper,
 }
 
 //------------------------------------------------------------------------------
+// Matching length (LZ77 / hash-chain)
+
+// Returns the number of leading uint32_t elements that compare equal between
+// array1 and array2 (capped at |length|). Bit-identical to the scalar C
+// reference (it computes the same match length).
+//
+// NEON has no movemask, so the per-iteration NEON->GPR "all lanes equal" test
+// is the costly part. Two design choices keep this a win at every match length
+// on both wide (Apple) and narrow (Graviton N1) cores:
+//   1. amortize the cross-domain extract over 16 lanes in the bulk loop;
+//   2. resolve the common SHORT match with a lean scalar head, and keep the
+//      NEON bulk in a separate noinline function so its code never bloats the
+//      hot short-match path. Short matches then run at scalar speed; only an
+//      established long match (HEAD elems equal) pays into the vector path.
+// Measured (perf): never slower than scalar for any match length on either uarch.
+
+// All-ones test of a uint32x4_t equality mask: AND the two 64-bit halves and
+// extract once (one cross-domain move).
+static WEBP_INLINE int AllEqual_NEON(const uint32x4_t cmp) {
+  const uint64x2_t c64 = vreinterpretq_u64_u32(cmp);
+  const uint64x1_t r = vand_u64(vget_low_u64(c64), vget_high_u64(c64));
+  return vget_lane_u64(r, 0) == ~(uint64_t)0;
+}
+
+#define VECTOR_MISMATCH_HEAD 16  // scalar-head length; covers N1's NEON-loses region
+
+// Cold path: NEON bulk for an established long match (match_len already matched).
+// noinline so it does not bloat the hot short-match path in VectorMismatch_NEON.
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static int VectorMismatchBulk_NEON(const uint32_t* const array1,
+                                   const uint32_t* const array2, int length,
+                                   int match_len) {
+  while (match_len + 16 <= length) {
+    const uint32x4_t c0 = vceqq_u32(vld1q_u32(array1 + match_len),
+                                    vld1q_u32(array2 + match_len));
+    const uint32x4_t c1 = vceqq_u32(vld1q_u32(array1 + match_len + 4),
+                                    vld1q_u32(array2 + match_len + 4));
+    const uint32x4_t c2 = vceqq_u32(vld1q_u32(array1 + match_len + 8),
+                                    vld1q_u32(array2 + match_len + 8));
+    const uint32x4_t c3 = vceqq_u32(vld1q_u32(array1 + match_len + 12),
+                                    vld1q_u32(array2 + match_len + 12));
+    if (!AllEqual_NEON(vandq_u32(vandq_u32(c0, c1), vandq_u32(c2, c3)))) break;
+    match_len += 16;
+  }
+  while (match_len + 4 <= length) {
+    const uint32x4_t c = vceqq_u32(vld1q_u32(array1 + match_len),
+                                   vld1q_u32(array2 + match_len));
+    if (!AllEqual_NEON(c)) break;
+    match_len += 4;
+  }
+  while (match_len < length && array1[match_len] == array2[match_len]) {
+    ++match_len;
+  }
+  return match_len;
+}
+
+// Hot path: lean scalar head; short matches resolve here at scalar speed.
+static int VectorMismatch_NEON(const uint32_t* const array1,
+                               const uint32_t* const array2, int length) {
+  int match_len = 0;
+  const int head = length < VECTOR_MISMATCH_HEAD ? length : VECTOR_MISMATCH_HEAD;
+  while (match_len < head && array1[match_len] == array2[match_len]) ++match_len;
+  if (match_len == VECTOR_MISMATCH_HEAD) {
+    return VectorMismatchBulk_NEON(array1, array2, length, match_len);
+  }
+  return match_len;
+}
+
+//------------------------------------------------------------------------------
 // Entry point
 
 extern void VP8LEncDspInitNEON(void);
@@ -470,6 +541,7 @@ WEBP_TSAN_IGNORE_FUNCTION void VP8LEncDspInitNEON(void) {
   VP8LCollectColorBlueTransforms = CollectColorBlueTransforms_NEON;
   VP8LCollectColorRedTransforms = CollectColorRedTransforms_NEON;
   VP8LCollectArgbHistos = CollectArgbHistos_NEON;
+  VP8LVectorMismatch = VectorMismatch_NEON;
 
   VP8LPredictorsSub[0] = PredictorSub0_NEON;
   VP8LPredictorsSub[1] = PredictorSub1_NEON;
