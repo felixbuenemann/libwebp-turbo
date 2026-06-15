@@ -376,6 +376,67 @@ static uint64_t CombinedShannonEntropy_SSE2(const uint32_t X[256],
 #endif
 
 //------------------------------------------------------------------------------
+// Combined entropy of two streams (run-length cost)
+
+// Local copy of the scalar helper (static in lossless_enc.c). Folds in the
+// contribution of a run of constant (X+Y) ending at index i.
+static WEBP_INLINE void EntropyUnrefinedHelper_SSE2(
+    uint32_t val, int i, uint32_t* WEBP_RESTRICT const val_prev,
+    int* WEBP_RESTRICT const i_prev, VP8LBitEntropy* WEBP_RESTRICT const e,
+    VP8LStreaks* WEBP_RESTRICT const stats) {
+  const int streak = i - *i_prev;
+  if (*val_prev != 0) {
+    e->sum += (*val_prev) * streak;
+    e->nonzeros += streak;
+    e->nonzero_code = *i_prev;
+    e->entropy += VP8LFastSLog2(*val_prev) * streak;
+    if (e->max_val < *val_prev) e->max_val = *val_prev;
+  }
+  stats->counts[*val_prev != 0] += (streak > 3);
+  stats->streaks[*val_prev != 0][(streak > 3)] += streak;
+  *val_prev = val;
+  *i_prev = i;
+}
+
+// Same result as GetCombinedEntropyUnrefined_C: skip 4-at-a-time through any
+// block of xy = X + Y that stays equal to the current run value, dropping to the
+// scalar per-element path only on blocks that contain a change.
+static void GetCombinedEntropyUnrefined_SSE2(
+    const uint32_t X[], const uint32_t Y[], int length,
+    VP8LBitEntropy* WEBP_RESTRICT const bit_entropy,
+    VP8LStreaks* WEBP_RESTRICT const stats) {
+  int i = 1, i_prev = 0;
+  uint32_t xy_prev = X[0] + Y[0];
+  memset(stats, 0, sizeof(*stats));
+  VP8LBitEntropyInit(bit_entropy);
+  while (i + 4 <= length) {
+    const __m128i xy = _mm_add_epi32(_mm_loadu_si128((const __m128i*)(X + i)),
+                                     _mm_loadu_si128((const __m128i*)(Y + i)));
+    const __m128i cmp = _mm_cmpeq_epi32(xy, _mm_set1_epi32((int)xy_prev));
+    if (_mm_movemask_epi8(cmp) == 0xffff) {
+      i += 4;  // whole block continues the current run
+    } else {
+      int k;
+      for (k = 0; k < 4; ++k, ++i) {
+        const uint32_t xyk = X[i] + Y[i];
+        if (xyk != xy_prev) {
+          EntropyUnrefinedHelper_SSE2(xyk, i, &xy_prev, &i_prev, bit_entropy,
+                                      stats);
+        }
+      }
+    }
+  }
+  for (; i < length; ++i) {
+    const uint32_t xy = X[i] + Y[i];
+    if (xy != xy_prev) {
+      EntropyUnrefinedHelper_SSE2(xy, i, &xy_prev, &i_prev, bit_entropy, stats);
+    }
+  }
+  EntropyUnrefinedHelper_SSE2(0, i, &xy_prev, &i_prev, bit_entropy, stats);
+  bit_entropy->entropy = VP8LFastSLog2(bit_entropy->sum) - bit_entropy->entropy;
+}
+
+//------------------------------------------------------------------------------
 
 static int VectorMismatch_SSE2(const uint32_t* const array1,
                                const uint32_t* const array2, int length) {
@@ -763,6 +824,7 @@ WEBP_TSAN_IGNORE_FUNCTION void VP8LEncDspInitSSE2(void) {
 #if !defined(DONT_USE_COMBINED_SHANNON_ENTROPY_SSE2_FUNC)
   VP8LCombinedShannonEntropy = CombinedShannonEntropy_SSE2;
 #endif
+  VP8LGetCombinedEntropyUnrefined = GetCombinedEntropyUnrefined_SSE2;
   VP8LVectorMismatch = VectorMismatch_SSE2;
   VP8LBundleColorMap = VP8LBundleColorMap_SSE;
 

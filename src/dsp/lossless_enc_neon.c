@@ -585,6 +585,66 @@ static uint64_t CombinedShannonEntropy_NEON(const uint32_t X[256],
 }
 
 //------------------------------------------------------------------------------
+// Combined entropy of two streams (run-length cost)
+
+// Local copy of the scalar helper (it is static in lossless_enc.c). Folds in the
+// contribution of a run of constant (X+Y) ending at index i.
+static WEBP_INLINE void EntropyUnrefinedHelper_NEON(
+    uint32_t val, int i, uint32_t* WEBP_RESTRICT const val_prev,
+    int* WEBP_RESTRICT const i_prev, VP8LBitEntropy* WEBP_RESTRICT const e,
+    VP8LStreaks* WEBP_RESTRICT const stats) {
+  const int streak = i - *i_prev;
+  if (*val_prev != 0) {
+    e->sum += (*val_prev) * streak;
+    e->nonzeros += streak;
+    e->nonzero_code = *i_prev;
+    e->entropy += VP8LFastSLog2(*val_prev) * streak;
+    if (e->max_val < *val_prev) e->max_val = *val_prev;
+  }
+  stats->counts[*val_prev != 0] += (streak > 3);
+  stats->streaks[*val_prev != 0][(streak > 3)] += streak;
+  *val_prev = val;
+  *i_prev = i;
+}
+
+// Same result as GetCombinedEntropyUnrefined_C. The cost is the scan that finds
+// where xy = X + Y changes; screen-content runs are long, so skip 4-at-a-time
+// through any block that stays equal to the current run value, dropping to the
+// exact scalar per-element path only on blocks that contain a change.
+static void GetCombinedEntropyUnrefined_NEON(
+    const uint32_t X[], const uint32_t Y[], int length,
+    VP8LBitEntropy* WEBP_RESTRICT const bit_entropy,
+    VP8LStreaks* WEBP_RESTRICT const stats) {
+  int i = 1, i_prev = 0;
+  uint32_t xy_prev = X[0] + Y[0];
+  memset(stats, 0, sizeof(*stats));
+  VP8LBitEntropyInit(bit_entropy);
+  while (i + 4 <= length) {
+    const uint32x4_t xy = vaddq_u32(vld1q_u32(X + i), vld1q_u32(Y + i));
+    if (AllEqual_NEON(vceqq_u32(xy, vdupq_n_u32(xy_prev)))) {
+      i += 4;  // whole block continues the current run
+    } else {
+      int k;
+      for (k = 0; k < 4; ++k, ++i) {
+        const uint32_t xyk = X[i] + Y[i];
+        if (xyk != xy_prev) {
+          EntropyUnrefinedHelper_NEON(xyk, i, &xy_prev, &i_prev, bit_entropy,
+                                      stats);
+        }
+      }
+    }
+  }
+  for (; i < length; ++i) {
+    const uint32_t xy = X[i] + Y[i];
+    if (xy != xy_prev) {
+      EntropyUnrefinedHelper_NEON(xy, i, &xy_prev, &i_prev, bit_entropy, stats);
+    }
+  }
+  EntropyUnrefinedHelper_NEON(0, i, &xy_prev, &i_prev, bit_entropy, stats);
+  bit_entropy->entropy = VP8LFastSLog2(bit_entropy->sum) - bit_entropy->entropy;
+}
+
+//------------------------------------------------------------------------------
 // Entry point
 
 extern void VP8LEncDspInitNEON(void);
@@ -597,6 +657,7 @@ WEBP_TSAN_IGNORE_FUNCTION void VP8LEncDspInitNEON(void) {
   VP8LCollectArgbHistos = CollectArgbHistos_NEON;
   VP8LVectorMismatch = VectorMismatch_NEON;
   VP8LCombinedShannonEntropy = CombinedShannonEntropy_NEON;
+  VP8LGetCombinedEntropyUnrefined = GetCombinedEntropyUnrefined_NEON;
 
   VP8LPredictorsSub[0] = PredictorSub0_NEON;
   VP8LPredictorsSub[1] = PredictorSub1_NEON;
